@@ -1,0 +1,33 @@
+# CDK
+node_modules/
+cdk.out/
+cdk.context.json
+.cdk.staging/
+
+# TypeScript build output
+*.js
+*.d.ts
+*.d.ts.map
+!cdk/jest.config.js
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+github.token
