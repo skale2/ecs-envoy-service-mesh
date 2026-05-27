@@ -5,6 +5,7 @@ import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { Construct } from 'constructs';
 import { MeshConfig } from './mesh-config';
+import { ENVOY_LISTENER_PORT, ENVOY_ADMIN_PORT } from './mesh-constants';
 
 export interface MeshEdgeProxyProps {
   meshConfig: MeshConfig;
@@ -60,8 +61,8 @@ export class MeshEdgeProxy extends Construct {
         AWS_REGION: region,
       },
       portMappings: [
-        { containerPort: 15000 },  // Envoy listener (receives NLB traffic)
-        { containerPort: 9901 },   // Envoy admin interface (/ready health check)
+        { containerPort: ENVOY_LISTENER_PORT },
+        { containerPort: ENVOY_ADMIN_PORT },
       ],
       healthCheck: {
         // Envoy's admin interface exposes /ready, which returns "LIVE"
@@ -119,11 +120,11 @@ export class MeshEdgeProxy extends Construct {
     // Allow NLB traffic into task security group
     const sg = mesh.taskSecurityGroup as ec2.SecurityGroup;
     sg.addIngressRule(
-      ec2.Peer.anyIpv4(), ec2.Port.tcp(15000),
+      ec2.Peer.anyIpv4(), ec2.Port.tcp(ENVOY_LISTENER_PORT),
       'Allow NLB traffic to edge proxy on Envoy port',
     );
     sg.addIngressRule(
-      ec2.Peer.anyIpv4(), ec2.Port.tcp(9901),
+      ec2.Peer.anyIpv4(), ec2.Port.tcp(ENVOY_ADMIN_PORT),
       'Allow NLB health checks on admin port',
     );
 
@@ -141,10 +142,37 @@ export class MeshEdgeProxy extends Construct {
   }
 
   private readonly _listenerPorts = new Set<number>();
+  private _targetGroup?: elbv2.NetworkTargetGroup;
+
+  /** Lazily create a single shared target group for all NLB listeners. */
+  private getTargetGroup(): elbv2.NetworkTargetGroup {
+    if (!this._targetGroup) {
+      this._targetGroup = new elbv2.NetworkTargetGroup(this, 'EnvoyTargetGroup', {
+        vpc: this.nlb.vpc!,
+        port: ENVOY_LISTENER_PORT,
+        protocol: elbv2.Protocol.TCP,
+        targets: [
+          this.ecsService.loadBalancerTarget({
+            containerName: 'envoy',
+            containerPort: ENVOY_LISTENER_PORT,
+          }),
+        ],
+        healthCheck: {
+          protocol: elbv2.Protocol.HTTP,
+          port: String(ENVOY_ADMIN_PORT),
+          path: '/ready',
+          interval: cdk.Duration.seconds(30),
+          healthyThresholdCount: 2,
+          unhealthyThresholdCount: 3,
+        },
+      });
+    }
+    return this._targetGroup;
+  }
 
   /**
    * Add an NLB listener for the given port if one doesn't already exist.
-   * All listeners forward to Envoy on port 15000; Envoy routes by Host header.
+   * All listeners forward to a shared target group on Envoy port 15000.
    */
   addListenerForPort(port: number) {
     if (this._listenerPorts.has(port)) return;
@@ -153,22 +181,6 @@ export class MeshEdgeProxy extends Construct {
     // nosec: This demo does not implement TLS termination on the NLB, but it can
     // be easily extended by adding an ACM certificate and switching to TLS protocol.
     const listener = this.nlb.addListener(`Listener${port}`, { port });
-    listener.addTargets(`Target${port}`, {
-      port: 15000,
-      targets: [
-        this.ecsService.loadBalancerTarget({
-          containerName: 'envoy',
-          containerPort: 15000,
-        }),
-      ],
-      healthCheck: {
-        protocol: elbv2.Protocol.HTTP,
-        port: '9901',
-        path: '/ready',
-        interval: cdk.Duration.seconds(30),
-        healthyThresholdCount: 2,
-        unhealthyThresholdCount: 3,
-      },
-    });
+    listener.addTargetGroups(`Target${port}`, this.getTargetGroup());
   }
 }

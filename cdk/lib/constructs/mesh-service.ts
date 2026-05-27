@@ -6,6 +6,7 @@ import * as route53_targets from 'aws-cdk-lib/aws-route53-targets';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
 import { Mesh } from './mesh';
+import { ENVOY_LISTENER_PORT, ENVOY_ADMIN_PORT, DEFAULT_APP_PORT, CLOUDWATCH_STATSD_PORT } from './mesh-constants';
 
 export interface MeshServiceProps {
   /** The Mesh this service belongs to. */
@@ -39,7 +40,7 @@ export class MeshService extends Construct {
     super(scope, id);
 
     const { mesh: { meshConfig: mesh, nlb } } = props;
-    const appPort = props.appPort ?? 8080;
+    const appPort = props.appPort ?? DEFAULT_APP_PORT;
     const dependencies = props.dependencies ?? [];
     const desiredCount = props.desiredCount ?? 1;
     const region = cdk.Stack.of(this).region;
@@ -54,7 +55,7 @@ export class MeshService extends Construct {
     const downstreamTargets = cdk.Lazy.string({
       produce: () => dependencies
         .map(dep => {
-          const depPort = props.mesh.getServicePort(dep) ?? 8080;
+          const depPort = props.mesh.getServicePort(dep) ?? DEFAULT_APP_PORT;
           return `${dep}.${mesh.meshDomain}:${depPort}`;
         })
         .join(','),
@@ -143,8 +144,8 @@ export class MeshService extends Construct {
         AWS_REGION: region,
       },
       portMappings: [
-        { containerPort: 15000 },  // Envoy listener (receives intercepted traffic)
-        { containerPort: 9901 },   // Envoy admin interface (/ready health check)
+        { containerPort: ENVOY_LISTENER_PORT },
+        { containerPort: ENVOY_ADMIN_PORT },
       ],
       healthCheck: {
         command: ['CMD-SHELL', 'curl -s http://localhost:9901/ready | grep -q LIVE || exit 1'],
@@ -167,7 +168,7 @@ export class MeshService extends Construct {
       metrics: {
         namespace: '/ecs/envoy-mesh/StatsD',
         metrics_collected: {
-          statsd: { service_address: ':8126', metrics_aggregation_interval: 60 },
+          statsd: { service_address: `:${CLOUDWATCH_STATSD_PORT}`, metrics_aggregation_interval: 60 },
         },
       },
     });
@@ -176,7 +177,7 @@ export class MeshService extends Construct {
       memoryLimitMiB: 128,
       cpu: 64,
       environment: { CW_CONFIG_CONTENT: cwAgentConfig },
-      portMappings: [{ containerPort: 8126, protocol: ecs.Protocol.UDP }],
+      portMappings: [{ containerPort: CLOUDWATCH_STATSD_PORT, protocol: ecs.Protocol.UDP }],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: `${props.serviceName}-cw-agent`,
       }),
