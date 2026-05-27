@@ -222,4 +222,9 @@ export class Mesh extends Construct {
     this._services[name] = { port, dependencies };
     this._edgeProxy.addListenerForPort(port);
   }
+
+  /** Returns the registered port for a service, or undefined if not yet registered. */
+  getServicePort(name: string): number | undefined {
+    return this._services[name]?.port;
+  }
 }

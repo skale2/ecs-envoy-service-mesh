@@ -49,10 +49,16 @@ export class MeshService extends Construct {
     props.mesh.registerService(props.serviceName, appPort, dependencies);
 
     // Auto-derive DOWNSTREAM_TARGETS from declared dependencies.
-    // e.g. dependencies: ['features'] → DOWNSTREAM_TARGETS: 'features.demo.mesh:8080'
-    const downstreamTargets = dependencies
-      .map(dep => `${dep}.${mesh.meshDomain}:${appPort}`)
-      .join(',');
+    // Uses Lazy to resolve each dependency's port at synth time (after all
+    // services have registered). Falls back to 8080 if not yet registered.
+    const downstreamTargets = cdk.Lazy.string({
+      produce: () => dependencies
+        .map(dep => {
+          const depPort = props.mesh.getServicePort(dep) ?? 8080;
+          return `${dep}.${mesh.meshDomain}:${depPort}`;
+        })
+        .join(','),
+    });
 
     // Amazon Route 53 alias record: {serviceName}.mesh.local -> edge proxy NLB.
     //
@@ -95,7 +101,7 @@ export class MeshService extends Construct {
       environment: {
         APP_PORT: String(appPort),
         SERVICE_NAME: props.serviceName,
-        ...(downstreamTargets ? { DOWNSTREAM_TARGETS: downstreamTargets } : {}),
+        ...(dependencies.length > 0 ? { DOWNSTREAM_TARGETS: downstreamTargets } : {}),
         ...props.appEnvironment,
       },
       portMappings: [{ containerPort: appPort }],

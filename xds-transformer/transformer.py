@@ -1,9 +1,9 @@
 """xDS Transformer – the control plane for this service mesh.
 
 This module is the bridge between AWS service discovery (AWS Cloud Map) and
-Envoy's xDS configuration format. ECS tasks register themselves in Cloud
-Map automatically; this transformer reads those registrations, converts
-them into Envoy-native CDS/LDS/RDS YAML files, and uploads them to S3.
+Envoy's xDS configuration format. ECS tasks register themselves in AWS Cloud
+Map automatically; this transformer reads those registrations, converts them
+into Envoy-native CDS/LDS/RDS YAML files, and uploads them to S3.
 Envoy sidecars and the edge proxy watch S3 (via a file sync sidecar) to
 pick up configuration changes.
 
@@ -127,7 +127,7 @@ def _list_cloudmap_service_ids() -> dict[str, str]:
 def _list_instances(service_id: str) -> list[dict]:
     """Return instances for a given AWS Cloud Map service ID.
 
-    ECS registers each running task as a AWS Cloud Map instance with these
+    ECS registers each running task as an AWS Cloud Map instance with these
     attributes:
       - AWS_INSTANCE_IPV4: the task's private IP (from the awsvpc ENI)
       - AWS_INSTANCE_PORT: the container port (defaults to 8080 if unset)
