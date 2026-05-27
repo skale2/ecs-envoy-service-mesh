@@ -17,8 +17,8 @@ export interface MeshControlPlaneProps {
 }
 
 /**
- * The mesh control plane: Cloud Map namespace (API-only), Route 53
- * hosted zone for service DNS, S3 xDS config bucket, and a Lambda
+ * The mesh control plane: AWS Cloud Map namespace (API-only), Amazon Route 53
+ * hosted zone for service DNS, Amazon S3 xDS config bucket, and an AWS Lambda
  * function scheduled via EventBridge that generates xDS configs.
  */
 export class MeshControlPlane extends Construct {
@@ -32,17 +32,17 @@ export class MeshControlPlane extends Construct {
 
     const { vpc } = props;
 
-    // Cloud Map HTTP namespace (API-only, no DNS records).
+    // AWS Cloud Map HTTP namespace (API-only, no DNS records).
     // We use HttpNamespace rather than DnsNamespace because we do NOT want
-    // Cloud Map to create DNS records. DNS resolution for mesh services is
-    // handled separately by Route 53 alias records that point to the NLB.
-    // Cloud Map's sole purpose here is as a service registry: ECS registers
-    // task IPs, and the transformer Lambda queries them via the Cloud Map API.
+    // AWS Cloud Map to create DNS records. DNS resolution for mesh services is
+    // handled separately by Amazon Route 53 alias records that point to the NLB.
+    // AWS Cloud Map's sole purpose here is as a service registry: ECS registers
+    // task IPs, and the transformer AWS Lambda queries them via the AWS Cloud Map API.
     this.namespace = new servicediscovery.HttpNamespace(this, 'Namespace', {
       name: props.meshDomain,
     });
 
-    // Route 53 private hosted zone for service DNS resolution.
+    // Amazon Route 53 private hosted zone for service DNS resolution.
     // Each MeshService creates an alias record (e.g. service-b.mesh.local)
     // pointing to the edge proxy NLB. This makes service names resolvable
     // from anywhere in the VPC.
@@ -57,8 +57,21 @@ export class MeshControlPlane extends Construct {
     // The sidecar's refresh loop calls HeadObject, compares the eTag to
     // the last-seen value, and only downloads when it differs -- avoiding
     // unnecessary disk writes that would trigger unnecessary Envoy reloads.
+    const xdsAccessLogBucket = new s3.Bucket(this, 'XdsAccessLogBucket', {
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+
     this.xdsBucket = new s3.Bucket(this, 'XdsBucket', {
       versioned: true,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      serverAccessLogsBucket: xdsAccessLogBucket,
+      serverAccessLogsPrefix: 'xds-bucket-access/',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
@@ -66,12 +79,17 @@ export class MeshControlPlane extends Construct {
     // The service registry is generated and deployed by the Mesh construct
     // (from the set of MeshService instances), not here.
 
-    // Envoy sidecar/edge-proxy task role.
-    // - S3 read: sidecars pull xDS configs from the bucket at startup and
-    //   periodically via the refresh loop.
-    // - SSM (AmazonSSMManagedInstanceCore): required for ECS Exec, which
-    //   lets operators open a shell into running containers for debugging.
-    //   Without this policy, `aws ecs execute-command` will fail.
+    // Envoy sidecar/edge-proxy task role — least-privilege permissions:
+    //
+    // 1. CRITICAL: S3 read-only on xDS bucket (grantRead below). Sidecars pull
+    //    xDS configs at startup and via the refresh loop. Read-only prevents
+    //    unauthorized config modification. Validate: S3 write from task should fail.
+    // 2. HIGH: SSM (AmazonSSMManagedInstanceCore). Required for ECS Exec debugging
+    //    via `aws ecs execute-command`. Enables secure shell access without SSH or
+    //    inbound ports. Validate: SSM session works without open inbound ports.
+    // 3. MEDIUM: CloudWatch (CloudWatchAgentServerPolicy). Enables the CW agent
+    //    sidecar to publish Envoy StatsD metrics. Validate: metrics appear in
+    //    /ecs/envoy-mesh/StatsD namespace.
     this.envoyTaskRole = new iam.Role(this, 'EnvoyTaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       managedPolicies: [
@@ -81,14 +99,14 @@ export class MeshControlPlane extends Construct {
     });
     this.xdsBucket.grantRead(this.envoyTaskRole);
 
-    // xDS Transformer Lambda.
-    // This Lambda queries Cloud Map to discover all registered service IPs,
+    // xDS Transformer AWS Lambda.
+    // This AWS Lambda queries AWS Cloud Map to discover all registered service IPs,
     // then generates Envoy xDS configuration files (CDS, LDS, RDS) and
     // writes them to S3 for each service and the edge proxy.
     //
-    // Scheduling strategy (Lambda + EventBridge):
-    //   - EventBridge triggers the Lambda every 1 minute.
-    //   - Inside each invocation, the Lambda loops internally every ~10
+    // Scheduling strategy (AWS Lambda + EventBridge):
+    //   - EventBridge triggers the AWS Lambda every 1 minute.
+    //   - Inside each invocation, the AWS Lambda loops internally every ~10
     //     seconds until it approaches its 55-second timeout.
     //   - This gives near-real-time config updates (~10s latency) without
     //     running a persistent polling service or paying for idle compute.
@@ -120,18 +138,20 @@ export class MeshControlPlane extends Construct {
     this.xdsBucket.grantReadWrite(transformerFn);
     transformerFn.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
-      actions: [
-        'servicediscovery:ListServices',
-        'servicediscovery:ListInstances',
-        'servicediscovery:DiscoverInstances',
-        'servicediscovery:ListNamespaces',
+      actions: ['servicediscovery:ListServices'],
+      resources: [this.namespace.namespaceArn],
+    }));
+    transformerFn.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['servicediscovery:ListInstances'],
+      resources: [
+        `arn:aws:servicediscovery:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:service/*`,
       ],
-      resources: ['*'],
     }));
 
     // EventBridge rule: invoke transformer every 1 minute.
     // See the scheduling strategy comment above for why this pairs with
-    // the Lambda's internal polling loop.
+    // the AWS Lambda's internal polling loop.
     new events.Rule(this, 'TransformerSchedule', {
       schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
       targets: [new events_targets.LambdaFunction(transformerFn)],

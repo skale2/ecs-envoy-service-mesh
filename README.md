@@ -4,7 +4,7 @@ A working demo of an Envoy-based service mesh on Amazon ECS (EC2 launch type). D
 
 - **Envoy sidecar proxies** on each service with transparent iptables egress interception
 - **Edge proxy** (standalone Envoy behind an NLB) for external traffic into the mesh
-- **xDS control plane** (Lambda + EventBridge) generating Envoy configs from Cloud Map
+- **xDS control plane** (AWS Lambda + EventBridge) generating Envoy configs from AWS Cloud Map
 - **Uniform DNS addressing** — callers use `{service}.{prefix}.mesh` whether inside or outside the mesh
 
 ## How It Works
@@ -14,7 +14,7 @@ Every service in the mesh gets a DNS name like `predict.demo.mesh`. The same add
 **From inside the mesh** (sidecar path):
 ```
 App calls predict.demo.mesh:8080
-  → DNS resolves to NLB IP (Route 53 alias)
+  → DNS resolves to NLB IP (Amazon Route 53 alias)
   → iptables intercepts the outbound TCP before it leaves
   → Redirects to local Envoy sidecar on port 15000
   → Envoy matches the Host header, routes to predict's task IPs
@@ -23,7 +23,7 @@ App calls predict.demo.mesh:8080
 **From outside the mesh** (edge proxy path):
 ```
 Client calls predict.demo.mesh:8080
-  → DNS resolves to NLB IP (Route 53 alias)
+  → DNS resolves to NLB IP (Amazon Route 53 alias)
   → NLB forwards to edge proxy Envoy on port 15000
   → Envoy matches the Host header, routes to predict's task IPs
 ```
@@ -69,7 +69,7 @@ aws ecs execute-command --cluster $CLUSTER --task $TASK \
 ### Option 2: From outside the mesh (edge proxy path)
 
 The stack deploys a bastion EC2 instance in the VPC. It can resolve mesh DNS
-names via the Route 53 private hosted zone, but it is **not** part of the mesh —
+names via the Amazon Route 53 private hosted zone, but it is **not** part of the mesh —
 it has no sidecar and no iptables. Its traffic goes through the NLB to the
 edge proxy, exactly like any external client would.
 
@@ -91,18 +91,18 @@ curl http://features.demo.mesh:8080/call/predict
 
 ```
                          ┌──────────────┐
-                         │  Lambda +    │
-                         │  EventBridge │  reads Cloud Map IPs,
-                         │  (xDS ctrl   │  writes xDS configs to S3
+                         │ AWS Lambda + │
+                         │  EventBridge │  reads AWS Cloud Map IPs,
+                         │  (xDS ctrl   │  writes xDS configs to Amazon S3
                          │   plane)     │
                          └──────┬───────┘
                                 │
                                 ▼
                          ┌──────────────┐
-                         │   S3 Bucket  │  CDS, EDS, LDS, RDS
+                         │ Amazon S3    │  CDS, EDS, LDS, RDS
                          │  (xDS YAML)  │  per service + edge proxy
                          └──────┬───────┘
-                                │ Envoy polls S3 every 5s
+                                │ Envoy polls Amazon S3 every 5s
                ┌────────────────┼────────────────┐
                ▼                ▼                 ▼
         ┌────────────┐  ┌────────────┐    ┌────────────┐
@@ -116,7 +116,7 @@ curl http://features.demo.mesh:8080/call/predict
         │ │iptables│ │  │ │iptables│ │          │
         │ └────────┘ │  │ └────────┘ │     NLB :8080
         └────────────┘  └────────────┘          │
-                                           Route 53
+                                           Amazon Route 53
                                         predict.demo.mesh
                                         features.demo.mesh
 ```
@@ -132,13 +132,13 @@ curl http://features.demo.mesh:8080/call/predict
 │           ├── mesh.ts          Mesh construct (cluster, control plane, edge proxy)
 │           ├── mesh-service.ts  Per-service construct (app + sidecar + DNS)
 │           ├── mesh-config.ts   Shared config interface
-│           ├── mesh-control-plane.ts   Cloud Map, Route 53, S3, Lambda
+│           ├── mesh-control-plane.ts   AWS Cloud Map, Amazon Route 53, Amazon S3, AWS Lambda
 │           └── mesh-edge-proxy.ts      NLB + standalone Envoy
-├── xds-transformer/             xDS config generator (Python Lambda)
-│   ├── transformer.py           Reads Cloud Map, writes CDS/EDS/LDS/RDS to S3
+├── xds-transformer/             xDS config generator (Python AWS Lambda)
+│   ├── transformer.py           Reads AWS Cloud Map, writes CDS/EDS/LDS/RDS to Amazon S3
 │   └── envoy_config.py          Envoy v3 API config builders
 ├── envoy-sidecar/               Single Docker image for sidecar + edge proxy
-│   ├── entrypoint.sh            iptables setup, S3 fetch, bootstrap, Envoy launch
+│   ├── entrypoint.sh            iptables setup, Amazon S3 fetch, bootstrap, Envoy launch
 │   └── Dockerfile
 └── sample-services/service/     Generic demo HTTP service (identity via env vars)
 ```

@@ -207,7 +207,7 @@ def build_listener(service_name):
         "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
         "name": f"{service_name}_listener",
         "address": {
-            "socket_address": {"address": "0.0.0.0", "port_value": 15000}
+            "socket_address": {"address": "0.0.0.0", "port_value": 15000}  # nosec B104 - Envoy must bind all interfaces for iptables interception
         },
         # use_original_dst tells Envoy to recover the original destination
         # from SO_ORIGINAL_DST (set by iptables REDIRECT). This metadata is

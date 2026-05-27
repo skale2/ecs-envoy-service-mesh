@@ -1,14 +1,14 @@
 """xDS Transformer – the control plane for this service mesh.
 
-This module is the bridge between AWS service discovery (Cloud Map) and
+This module is the bridge between AWS service discovery (AWS Cloud Map) and
 Envoy's xDS configuration format. ECS tasks register themselves in Cloud
 Map automatically; this transformer reads those registrations, converts
 them into Envoy-native CDS/LDS/RDS YAML files, and uploads them to S3.
 Envoy sidecars and the edge proxy watch S3 (via a file sync sidecar) to
 pick up configuration changes.
 
-The flow:  ECS task starts -> registers in Cloud Map -> this Lambda reads
-Cloud Map -> generates Envoy xDS YAML -> writes to S3 -> Envoy reloads.
+The flow:  ECS task starts -> registers in AWS Cloud Map -> this AWS Lambda function reads
+AWS Cloud Map -> generates Envoy xDS YAML -> writes to S3 -> Envoy reloads.
 """
 
 import hashlib
@@ -51,8 +51,8 @@ s3_client = boto3.client("s3", region_name=AWS_REGION)
 sd_client = boto3.client("servicediscovery", region_name=AWS_REGION)
 
 # In-memory checksum cache keyed by S3 object key -> MD5 hex digest.
-# This avoids redundant S3 PutObject calls within a single Lambda invocation.
-# Because the Lambda loops internally (see handler()), the same process may
+# This avoids redundant S3 PutObject calls within a single AWS Lambda invocation.
+# Because the AWS Lambda function loops internally (see handler()), the same process may
 # run multiple discovery cycles — the cache ensures we only write when the
 # generated YAML actually changes between cycles.
 _checksum_cache: dict[str, str] = {}
@@ -63,7 +63,7 @@ _checksum_cache: dict[str, str] = {}
 # ---------------------------------------------------------------------------
 
 def _md5(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
 
 
 def _upload_if_changed(key: str, content: dict) -> bool:
@@ -103,16 +103,16 @@ def read_service_registry() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Cloud Map discovery
+# AWS Cloud Map discovery
 # ---------------------------------------------------------------------------
 
 def _list_cloudmap_service_ids() -> dict[str, str]:
-    """Return a mapping of service name -> Cloud Map service ID.
+    """Return a mapping of service name -> AWS Cloud Map service ID.
 
-    ECS services automatically register their tasks in Cloud Map when the
+    ECS services automatically register their tasks in AWS Cloud Map when the
     ECS service definition includes `serviceRegistries` (set via CDK's
     `cloudMapOptions` or `associateCloudMapService`). Each ECS service
-    creates a corresponding Cloud Map service within our namespace.
+    creates a corresponding AWS Cloud Map service within our namespace.
     """
     service_map: dict[str, str] = {}
     paginator = sd_client.get_paginator("list_services")
@@ -125,9 +125,9 @@ def _list_cloudmap_service_ids() -> dict[str, str]:
 
 
 def _list_instances(service_id: str) -> list[dict]:
-    """Return instances for a given Cloud Map service ID.
+    """Return instances for a given AWS Cloud Map service ID.
 
-    ECS registers each running task as a Cloud Map instance with these
+    ECS registers each running task as a AWS Cloud Map instance with these
     attributes:
       - AWS_INSTANCE_IPV4: the task's private IP (from the awsvpc ENI)
       - AWS_INSTANCE_PORT: the container port (defaults to 8080 if unset)
@@ -148,10 +148,10 @@ def _list_instances(service_id: str) -> list[dict]:
 
 
 def discover_endpoints(service_names: list[str]) -> dict[str, list[dict]]:
-    """Discover live endpoints for all requested services via Cloud Map.
+    """Discover live endpoints for all requested services via AWS Cloud Map.
 
     This is the core bridge between the AWS world and the Envoy world:
-    Cloud Map holds the source of truth for which ECS tasks are running
+    AWS Cloud Map holds the source of truth for which ECS tasks are running
     (IP + port + AZ), and Envoy needs that information as endpoint
     addresses inside STATIC cluster definitions. This function reads
     the former and returns data shaped for the latter.
@@ -160,13 +160,13 @@ def discover_endpoints(service_names: list[str]) -> dict[str, list[dict]]:
     try:
         cm_services = _list_cloudmap_service_ids()
     except Exception:
-        logger.exception("Failed to list Cloud Map services")
+        logger.exception("Failed to list AWS Cloud Map services")
         return endpoints_map
 
     for name in service_names:
         sid = cm_services.get(name)
         if not sid:
-            logger.warning("Service %s not found in Cloud Map", name)
+            logger.warning("Service %s not found in AWS Cloud Map", name)
             endpoints_map[name] = []
             continue
         try:
@@ -217,7 +217,7 @@ def generate_and_upload(registry: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lambda handler
+# AWS Lambda handler
 # ---------------------------------------------------------------------------
 
 def handler(event, context):
@@ -225,7 +225,7 @@ def handler(event, context):
 
     EventBridge's minimum schedule rate is 1 minute, but we want endpoint
     updates roughly every 10 seconds for fast scaling response. To work
-    around this, the Lambda loops internally — each invocation runs multiple
+    around this, the AWS Lambda function loops internally — each invocation runs multiple
     discovery-and-upload cycles, sleeping 10s between them, until the
     remaining execution time drops below 15s. This gives us ~5 cycles per
     1-minute invocation without needing a long-running process.

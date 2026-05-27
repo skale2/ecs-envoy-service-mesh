@@ -39,7 +39,7 @@ echo "AWS_REGION: ${AWS_REGION}"
 #
 # This is the core of transparent mesh routing. The chain of events:
 #   1. App calls service-b.mesh.local:8080
-#   2. DNS resolves to the NLB IP (via the Route 53 alias record)
+#   2. DNS resolves to the NLB IP (via the Amazon Route 53 alias record)
 #   3. App initiates a TCP connection to that IP on port 8080
 #   4. The iptables OUTPUT chain catches the outgoing SYN packet
 #   5. The ENVOY_EGRESS chain redirects it to 127.0.0.1:15000
@@ -204,7 +204,7 @@ echo "Bootstrap config written to ${CONFIG_DIR}/envoy.yaml"
 #
 # Polls S3 every 5 seconds for updated xDS configs. Uses S3 eTags to avoid
 # unnecessary downloads and disk writes. Only when the eTag changes (meaning
-# the Lambda uploaded new content) do we download and mv the file, which
+# the AWS Lambda function uploaded new content) do we download and mv the file, which
 # triggers Envoy's inotify-based hot-reload.
 # =============================================================================
 ETAG_DIR="/tmp/etags"

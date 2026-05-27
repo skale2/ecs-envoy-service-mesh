@@ -98,7 +98,7 @@ export class MeshEdgeProxy extends Construct {
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'edge-proxy-cw-agent' }),
     });
 
-    // Cloud Map service for API-based discovery (HTTP namespace, no DNS)
+    // AWS Cloud Map service for API-based discovery (HTTP namespace, no DNS)
     const cmService = new servicediscovery.Service(this, 'CloudMapService', {
       namespace: mesh.namespace,
       name: 'edge-proxy',
@@ -138,14 +138,22 @@ export class MeshEdgeProxy extends Construct {
       clientRoutingPolicy: elbv2.ClientRoutingPolicy.AVAILABILITY_ZONE_AFFINITY,
     });
 
-    // NLB port mapping: listens on 8080 (the service port callers use)
-    // and forwards to 15000 (Envoy's listener port inside the container).
-    // This means callers use the same address:port whether they are inside
-    // or outside the mesh -- e.g. service-b.mesh.local:8080 always works.
-    // Inside the mesh, iptables intercepts before traffic reaches the NLB.
-    // Outside the mesh, the NLB forwards to the edge proxy's Envoy.
-    const listener = this.nlb.addListener('ServicePortListener', { port: 8080 });
-    listener.addTargets('Target', {
+  }
+
+  private readonly _listenerPorts = new Set<number>();
+
+  /**
+   * Add an NLB listener for the given port if one doesn't already exist.
+   * All listeners forward to Envoy on port 15000; Envoy routes by Host header.
+   */
+  addListenerForPort(port: number) {
+    if (this._listenerPorts.has(port)) return;
+    this._listenerPorts.add(port);
+
+    // nosec: This demo does not implement TLS termination on the NLB, but it can
+    // be easily extended by adding an ACM certificate and switching to TLS protocol.
+    const listener = this.nlb.addListener(`Listener${port}`, { port });
+    listener.addTargets(`Target${port}`, {
       port: 15000,
       targets: [
         this.ecsService.loadBalancerTarget({
@@ -154,9 +162,6 @@ export class MeshEdgeProxy extends Construct {
         }),
       ],
       healthCheck: {
-        // HTTP health check against Envoy's admin interface on port 9901.
-        // The /ready endpoint returns 200 with body "LIVE" when Envoy has
-        // loaded its configuration and is ready to route traffic.
         protocol: elbv2.Protocol.HTTP,
         port: '9901',
         path: '/ready',

@@ -11,7 +11,7 @@ export interface MeshServiceProps {
   /** The Mesh this service belongs to. */
   mesh: Mesh;
 
-  /** Logical service name (used for Cloud Map, S3 paths, DNS, logging). */
+  /** Logical service name (used for AWS Cloud Map, S3 paths, DNS, logging). */
   serviceName: string;
   /** Docker image for the application container. */
   appImage: ecr_assets.DockerImageAsset;
@@ -54,7 +54,7 @@ export class MeshService extends Construct {
       .map(dep => `${dep}.${mesh.meshDomain}:${appPort}`)
       .join(',');
 
-    // Route 53 alias record: {serviceName}.mesh.local -> edge proxy NLB.
+    // Amazon Route 53 alias record: {serviceName}.mesh.local -> edge proxy NLB.
     //
     // This is what makes `service-b.mesh.local` resolve to an IP address.
     // The record points to the NLB, but traffic only reaches it from
@@ -116,10 +116,11 @@ export class MeshService extends Construct {
     const envoyLinuxParams = new ecs.LinuxParameters(this, 'EnvoyLinuxParams', {
       initProcessEnabled: true,
     });
-    // NET_ADMIN: required to create and manipulate iptables rules in the
-    //   task's network namespace (nat table, custom chains, REDIRECT target).
-    // NET_RAW: required for iptables to use raw sockets when setting up
-    //   the REDIRECT rules.
+    // nosec: NET_ADMIN and NET_RAW are required for iptables-based transparent traffic
+    // interception in the entrypoint script. Mitigations: these capabilities are scoped
+    // to the Envoy container only (not the app container), and Envoy runs as non-root
+    // UID 101 after iptables setup completes. For production, consider AppArmor or
+    // SELinux profiles to further limit the scope of these capabilities.
     envoyLinuxParams.addCapabilities(ecs.Capability.NET_ADMIN, ecs.Capability.NET_RAW);
 
     const envoyContainer = taskDef.addContainer('envoy', {
@@ -185,9 +186,9 @@ export class MeshService extends Construct {
       condition: ecs.ContainerDependencyCondition.HEALTHY,
     });
 
-    // Cloud Map service for API-based discovery (HTTP namespace, no DNS).
-    // ECS automatically registers/deregisters task IPs with this Cloud Map
-    // service via associateCloudMapService() below. The transformer Lambda
+    // AWS Cloud Map service for API-based discovery (HTTP namespace, no DNS).
+    // ECS automatically registers/deregisters task IPs with this AWS Cloud Map
+    // service via associateCloudMapService() below. The transformer AWS Lambda
     // queries these registrations to discover which IPs back each service,
     // then generates xDS configs with those IPs as upstream endpoints.
     const cmService = new servicediscovery.Service(this, 'CloudMapService', {
@@ -205,7 +206,7 @@ export class MeshService extends Construct {
       maxHealthyPercent: 200,
       securityGroups: [mesh.taskSecurityGroup],
     });
-    // Binds the ECS service to Cloud Map so that task IPs are automatically
+    // Binds the ECS service to AWS Cloud Map so that task IPs are automatically
     // registered/deregistered as tasks start and stop.
     this.ecsService.associateCloudMapService({ service: cmService });
   }

@@ -7,9 +7,10 @@
 # (for pulling xDS configs from S3).
 # =============================================================================
 
-# Official Envoy image -- provides the envoy binary, default configs,
-# and the envoy user (UID 101) already baked in.
-FROM envoyproxy/envoy:v1.29-latest
+# nosec: This is the official Envoy Proxy image from Docker Hub, a public
+# CNCF project not owned by Amazon. Using upstream images for open-source
+# infrastructure components is a well-established pattern.
+FROM envoyproxy/envoy:v1.36-latest
 
 # Install dependencies:
 #   - iptables: used by the entrypoint (in sidecar mode) to set up NAT rules

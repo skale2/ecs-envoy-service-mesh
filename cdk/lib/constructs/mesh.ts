@@ -48,6 +48,7 @@ export class Mesh extends Construct {
 
   // Accumulated by MeshService constructors, used to generate the service registry
   private readonly _services: Record<string, { port: number; dependencies: string[] }> = {};
+  private readonly _edgeProxy: MeshEdgeProxy;
 
   constructor(scope: Construct, id: string, props: MeshProps) {
     super(scope, id);
@@ -73,6 +74,9 @@ export class Mesh extends Construct {
       description: 'ECS cluster instances',
       allowAllOutbound: true,
     });
+    // nosec: Allow-all intra-VPC for demo debuggability (e.g., direct task IP access
+    // from bastion). For production, restrict to specific ports: 8080 (app), 15000
+    // (Envoy), 9901 (admin/health checks), 8126/UDP (StatsD).
     clusterSg.addIngressRule(
       ec2.Peer.ipv4(vpc.vpcCidrBlock),
       ec2.Port.allTraffic(),
@@ -82,6 +86,13 @@ export class Mesh extends Construct {
     const userData = ec2.UserData.forLinux();
     userData.addCommands('echo ECS_ENABLE_TASK_ENI_TRUNKING=true >> /etc/ecs/ecs.config');
 
+    // Security controls (implementation priority):
+    // 1. CRITICAL: IMDSv2 enforced (requireImdsv2: true) — prevents SSRF-based
+    //    credential theft by requiring token-based metadata requests.
+    //    Validate: `curl http://169.254.169.254/latest/meta-data/` without token fails.
+    // 2. HIGH: Security groups restrict network access (see clusterSg/taskSg above).
+    //    Validate: verify only expected ports are reachable from outside the VPC.
+    // 3. MEDIUM: Instance role scoped to ECS + SSM only — no broad admin access.
     const launchTemplate = new ec2.LaunchTemplate(this, 'LaunchTemplate', {
       instanceType: props.instanceType ?? new ec2.InstanceType('t3.medium'),
       machineImage: ecs.EcsOptimizedImage.amazonLinux2023(),
@@ -121,6 +132,9 @@ export class Mesh extends Construct {
       description: 'ECS tasks (awsvpc mode)',
       allowAllOutbound: true,
     });
+    // nosec: Allow-all intra-VPC for demo debuggability (e.g., direct task IP access
+    // from bastion). For production, restrict to specific ports: 8080 (app), 15000
+    // (Envoy), 9901 (admin/health checks), 8126/UDP (StatsD).
     taskSg.addIngressRule(
       ec2.Peer.ipv4(vpc.vpcCidrBlock),
       ec2.Port.allTraffic(),
@@ -136,7 +150,7 @@ export class Mesh extends Construct {
     });
 
     // -------------------------------------------------------
-    // Control Plane (Cloud Map, Route 53, S3, Lambda transformer)
+    // Control Plane (AWS Cloud Map, Amazon Route 53, Amazon S3, AWS Lambda transformer)
     // -------------------------------------------------------
     const controlPlane = new MeshControlPlane(this, 'ControlPlane', { vpc, meshDomain });
 
@@ -162,11 +176,11 @@ export class Mesh extends Construct {
     // -------------------------------------------------------
     // Edge Proxy (NLB + standalone Envoy)
     // -------------------------------------------------------
-    const edgeProxy = new MeshEdgeProxy(this, 'EdgeProxy', {
+    this._edgeProxy = new MeshEdgeProxy(this, 'EdgeProxy', {
       meshConfig: this.meshConfig,
       vpc,
     });
-    this.nlb = edgeProxy.nlb;
+    this.nlb = this._edgeProxy.nlb;
 
     // -------------------------------------------------------
     // Service Registry (generated lazily at synth time)
@@ -199,12 +213,13 @@ export class Mesh extends Construct {
     });
     new cdk.CfnOutput(this, 'CloudMapNamespaceId', {
       value: controlPlane.namespace.namespaceId,
-      description: 'Cloud Map namespace ID',
+      description: 'AWS Cloud Map namespace ID',
     });
   }
 
   /** Called by MeshService to register itself in the service registry. */
   registerService(name: string, port: number, dependencies: string[]) {
     this._services[name] = { port, dependencies };
+    this._edgeProxy.addListenerForPort(port);
   }
 }

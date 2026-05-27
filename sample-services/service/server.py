@@ -71,7 +71,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             req = urllib.request.Request(f"{base_url}/")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 - scheme is always http, constructed in _parse_targets()
                 body = json.loads(resp.read().decode())
                 self._respond(200, {
                     "service": SERVICE_NAME,
@@ -94,6 +94,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)  # nosec B104 - ECS container must listen on all interfaces
     print(f"{SERVICE_NAME} listening on port {PORT}")
     server.serve_forever()
