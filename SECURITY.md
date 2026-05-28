@@ -82,7 +82,7 @@ Principle of least privilege is applied to:
 
 ### IAM
 - Task roles follow least-privilege (read-only S3 access, scoped managed policies)
-- Service Discovery: `ListServices` scoped to namespace ARN, `ListInstances` scoped to account/region (AWS API does not support namespace-level scoping for this action)
+- Service Discovery: `ListServices` and `ListInstances` require `resources: ["*"]` (AWS IAM rejects any resource-level scoping for these actions — confirmed by deployment failure). Scoping is enforced at the application layer via the `CLOUDMAP_NAMESPACE_ID` filter. Only 2 actions are granted (unused `DiscoverInstances` and `ListNamespaces` were removed).
 - Managed policies used only where appropriate (SSM, CloudWatch, ECS execution)
 
 ### AWS Lambda
