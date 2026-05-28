@@ -136,17 +136,12 @@ export class MeshControlPlane extends Construct {
     });
 
     this.xdsBucket.grantReadWrite(transformerFn);
+    // ListServices and ListInstances do not support resource-level IAM scoping —
+    // they require 'resources: ["*"]'. The Lambda itself filters by namespace ID.
     transformerFn.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
-      actions: ['servicediscovery:ListServices'],
-      resources: [this.namespace.namespaceArn],
-    }));
-    transformerFn.addToRolePolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      actions: ['servicediscovery:ListInstances'],
-      resources: [
-        `arn:aws:servicediscovery:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:service/*`,
-      ],
+      actions: ['servicediscovery:ListServices', 'servicediscovery:ListInstances'],
+      resources: ['*'],
     }));
 
     // EventBridge rule: invoke transformer every 1 minute.
