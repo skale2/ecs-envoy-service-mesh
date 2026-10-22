@@ -38,7 +38,8 @@ The edge proxy receives external traffic via the NLB without iptables intercepti
 Principle of least privilege is applied to:
 
 - **Envoy task role**: S3 read-only access (xDS configs), SSM for ECS Exec debugging, CloudWatch for metrics
-- **Transformer Lambda role**: `ListServices` scoped to the mesh namespace ARN, `ListInstances` scoped to account/region, S3 read/write to the xDS bucket only
+- **Transformer Lambda role**: `ListServices` scoped to the mesh namespace ARN, `ListInstances` scoped to account/region, S3 read/write to the xDS bucket, and read-only on the service registry table. The transformer never writes the registry; it only renders it.
+- **Service API Lambda role**: read/write on the service registry table, read-only on the xDS bucket (it only needs the per-service CloudFormation template), and CloudFormation create/delete scoped to `mesh-svc-*` stacks. The split matters: the API owns the registry and the transformer owns the generated config, so neither can corrupt the other's state.
 - **ECS execution role**: Standard `AmazonECSTaskExecutionRolePolicy` for image pull and log creation
 
 ### Container Security
@@ -53,6 +54,7 @@ Principle of least privilege is applied to:
 - S3 xDS configuration bucket: Encrypted with SSE-S3 (AES-256)
 - Block Public Access enabled on all S3 buckets
 - S3 access logging enabled to a dedicated log bucket
+- Service registry table: DynamoDB encryption at rest (always on), point-in-time recovery enabled, no resource policy — reachable only through IAM by the two Lambda roles above
 
 **In transit:**
 - NLB to edge proxy: Plaintext within VPC (demo only; see below)
@@ -76,9 +78,9 @@ Principle of least privilege is applied to:
 - Access logging to dedicated bucket
 
 ### Network Load Balancer
-- Internet-facing by design (mesh ingress point)
+- Internal: reachable from inside the VPC only, which is all the mesh ingress needs. Nothing in the mesh is reachable from the internet.
 - Health checks use Envoy admin `/ready` endpoint
-- Production recommendation: Add AWS Shield Advanced for DDoS protection, consider AWS WAF via ALB if HTTP inspection is needed
+- Production recommendation: If the mesh ever needs a public entry point, put it behind a separate internet-facing load balancer with TLS termination, AWS WAF and Shield Advanced, rather than making this one public.
 
 ### IAM
 - Task roles follow least-privilege (read-only S3 access, scoped managed policies)
@@ -91,8 +93,10 @@ Principle of least privilege is applied to:
 - Timeout configured to prevent runaway invocations
 
 ### Security Groups
-- Demo: Allow-all intra-VPC for debuggability
-- Production recommendation: Restrict to specific ports — 8080 (app), 15000 (Envoy), 9901 (admin), 8126/UDP (StatsD)
+- One group for all awsvpc tasks, allowing intra-VPC traffic only (demo debuggability). No rule in the mesh admits traffic from outside the VPC.
+- The edge proxy needs no rule of its own. Its NLB is internal, so every client — and every health check — reaches it from a VPC-local address that the intra-VPC rule already covers.
+- Nothing opens the Envoy admin port (9901) beyond the VPC. It serves `/config_dump`, which lists every endpoint IP in the mesh, and accepts `POST /quitquitquit`, and it has no authentication of its own.
+- Production recommendation: Restrict the intra-VPC rule to specific ports — 8080 (app), 15000 (Envoy), 9901 (admin), 8126/UDP (StatsD)
 
 ## Risk Assessment
 
@@ -102,7 +106,7 @@ Principle of least privilege is applied to:
 ### Operational Risks
 - **No mTLS**: Services within the mesh communicate in plaintext. A compromised task could sniff traffic. Mitigate by enabling Envoy mTLS.
 - **Envoy admin interface (port 9901)**: Exposes operational endpoints. Accessible only within VPC via security groups.
-- **Control plane latency**: Endpoint updates propagate within ~10 seconds. During this window, traffic may route to terminating tasks.
+- **Control plane latency**: Endpoint updates propagate in a few seconds — an ECS task state change invokes the transformer, and sidecars pick up the new config on their next 5-second poll. Traffic may route to a terminating task during that window.
 
 ### Container Capability Risks
 - NET_ADMIN allows iptables manipulation. A compromised Envoy container could alter routing rules. Mitigated by running as non-root after setup.

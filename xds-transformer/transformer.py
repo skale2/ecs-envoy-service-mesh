@@ -12,17 +12,15 @@ AWS Cloud Map -> generates Envoy xDS YAML -> writes to S3 -> Envoy reloads.
 """
 
 import hashlib
-import json
 import logging
 import os
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 import yaml
 
 from envoy_config import (
     build_clusters_config,
-    build_eds_config,
     build_listeners_config,
     build_routes_config,
 )
@@ -35,7 +33,10 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CLOUDMAP_NAMESPACE_ID = os.environ.get("CLOUDMAP_NAMESPACE_ID", "")
 MESH_DOMAIN = os.environ.get("MESH_DOMAIN", "mesh.local")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-REGISTRY_KEY = "service-registry.json"
+REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "")
+# Matches DEFAULT_APP_PORT in the CDK constants; only used as a fallback
+# for an AWS Cloud Map instance registered without an explicit port.
+DEFAULT_APP_PORT = 8080
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,36 +50,31 @@ logger = logging.getLogger(__name__)
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 sd_client = boto3.client("servicediscovery", region_name=AWS_REGION)
-
-# In-memory checksum cache keyed by S3 object key -> MD5 hex digest.
-# This avoids redundant S3 PutObject calls within a single AWS Lambda invocation.
-# Because the AWS Lambda function loops internally (see handler()), the same process may
-# run multiple discovery cycles — the cache ensures we only write when the
-# generated YAML actually changes between cycles.
-_checksum_cache: dict[str, str] = {}
+ddb_client = boto3.client("dynamodb", region_name=AWS_REGION)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _md5(data: bytes) -> str:
-    return hashlib.md5(data, usedforsecurity=False).hexdigest()
-
-
 def _upload_if_changed(key: str, content: dict) -> bool:
-    """Serialize *content* to YAML and upload to S3 only if the content changed.
+    """Write *content* to S3 as YAML, but only if the bytes differ.
 
-    Lazy-write pattern: we hash the serialized YAML and compare against the
-    last-known hash in _checksum_cache. If the mesh is stable (no tasks
-    scaling in/out), most cycles produce identical configs — this avoids
-    unnecessary S3 writes and the Envoy config reloads they would trigger.
+    An object's S3 eTag is the MD5 of its content, and the sidecars decide
+    whether to reload by watching that eTag. So asking S3 what it already
+    holds is both the cheapest way to skip a redundant write and exactly the
+    comparison the consumers make — a HeadObject in place of a PutObject,
+    and no new object version for a config that did not change.
     """
-    raw = yaml.dump(content, default_flow_style=False).encode("utf-8")
-    digest = _md5(raw)
+    raw = yaml.dump(content, Dumper=yaml.CSafeDumper, default_flow_style=False).encode("utf-8")
+    digest = hashlib.md5(raw, usedforsecurity=False).hexdigest()
 
-    if _checksum_cache.get(key) == digest:
-        return False
+    try:
+        current = s3_client.head_object(Bucket=S3_BUCKET, Key=key)["ETag"].strip('"')
+        if current == digest:
+            return False
+    except s3_client.exceptions.ClientError:
+        pass  # not there yet, so write it
 
     s3_client.put_object(
         Bucket=S3_BUCKET,
@@ -86,134 +82,121 @@ def _upload_if_changed(key: str, content: dict) -> bool:
         Body=raw,
         ContentType="application/x-yaml",
     )
-    _checksum_cache[key] = digest
     logger.info("Uploaded %s (md5=%s)", key, digest)
     return True
 
 
-def read_service_registry() -> dict:
-    """Download and parse the service registry JSON from S3."""
-    try:
-        response = s3_client.get_object(Bucket=S3_BUCKET, Key=REGISTRY_KEY)
-        body = response["Body"].read()
-        return json.loads(body)
-    except Exception:
-        logger.exception("Failed to read service registry from s3://%s/%s", S3_BUCKET, REGISTRY_KEY)
-        return {}
+# Everything this function does is network-bound, and the work per service is
+# independent, so it is all run through one pool. This is what keeps a mesh of
+# several hundred services inside a single invocation: serially, a few thousand
+# round-trips at ~20ms each would not finish, and concurrency is pinned to 1 so
+# there is no second invocation to pick up the slack. botocore clients are
+# thread-safe for concurrent calls, so the module-level clients are shared.
+_POOL_SIZE = 32
+
+
+def _in_parallel(fn, items):
+    """Map *fn* over *items* concurrently, preserving order."""
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=min(_POOL_SIZE, len(items))) as pool:
+        return list(pool.map(fn, items))
+
+
+def _paginate(client, operation: str, key: str, **kwargs):
+    """Yield every item of a paginated AWS response."""
+    for page in client.get_paginator(operation).paginate(**kwargs):
+        yield from page.get(key, [])
+
+
+def read_service_registry() -> dict[str, int]:
+    """Return {service name: app port} for every service in the mesh.
+
+    Both entrypoints write into this one table, so there is nothing to merge:
+    a service declared in CDK and a service created by POST /services are the
+    same kind of row and this function can't tell them apart.
+    """
+    return {
+        item["name"]["S"]: int(item["port"]["N"])
+        for item in _paginate(ddb_client, "scan", "Items", TableName=REGISTRY_TABLE)
+    }
 
 
 # ---------------------------------------------------------------------------
 # AWS Cloud Map discovery
 # ---------------------------------------------------------------------------
 
-def _list_cloudmap_service_ids() -> dict[str, str]:
-    """Return a mapping of service name -> AWS Cloud Map service ID.
-
-    ECS services automatically register their tasks in AWS Cloud Map when the
-    ECS service definition includes `serviceRegistries` (set via CDK's
-    `cloudMapOptions` or `associateCloudMapService`). Each ECS service
-    creates a corresponding AWS Cloud Map service within our namespace.
-    """
-    service_map: dict[str, str] = {}
-    paginator = sd_client.get_paginator("list_services")
-    for page in paginator.paginate(
-        Filters=[{"Name": "NAMESPACE_ID", "Values": [CLOUDMAP_NAMESPACE_ID]}]
-    ):
-        for svc in page.get("Services", []):
-            service_map[svc["Name"]] = svc["Id"]
-    return service_map
-
-
-def _list_instances(service_id: str) -> list[dict]:
-    """Return instances for a given AWS Cloud Map service ID.
-
-    ECS registers each running task as an AWS Cloud Map instance with these
-    attributes:
-      - AWS_INSTANCE_IPV4: the task's private IP (from the awsvpc ENI)
-      - AWS_INSTANCE_PORT: the container port (defaults to 8080 if unset)
-      - AVAILABILITY_ZONE: the AZ where the task is running (e.g. us-east-1a)
-    We extract these to build Envoy endpoint definitions.
-    """
-    instances: list[dict] = []
-    paginator = sd_client.get_paginator("list_instances")
-    for page in paginator.paginate(ServiceId=service_id):
-        for inst in page.get("Instances", []):
-            attrs = inst.get("Attributes", {})
-            ip = attrs.get("AWS_INSTANCE_IPV4")
-            port = attrs.get("AWS_INSTANCE_PORT", "8080")
-            az = attrs.get("AVAILABILITY_ZONE", "unknown")
-            if ip:
-                instances.append({"ip": ip, "port": int(port), "az": az})
-    return instances
-
-
 def discover_endpoints(service_names: list[str]) -> dict[str, list[dict]]:
-    """Discover live endpoints for all requested services via AWS Cloud Map.
+    """Return {service name: [{ip, port, az}, ...]} from AWS Cloud Map.
 
-    This is the core bridge between the AWS world and the Envoy world:
-    AWS Cloud Map holds the source of truth for which ECS tasks are running
-    (IP + port + AZ), and Envoy needs that information as endpoint
-    addresses inside STATIC cluster definitions. This function reads
-    the former and returns data shaped for the latter.
+    This is the bridge between the AWS world and the Envoy world. ECS
+    registers each running task in AWS Cloud Map as it starts, tagged with
+    the task's awsvpc ENI address (AWS_INSTANCE_IPV4), its container port,
+    and its AZ. Envoy wants exactly that, shaped as endpoints inside a
+    cluster. This reads the former and returns the latter.
+
+    A service with no live tasks maps to an empty list rather than being
+    omitted, so it still gets a cluster with no endpoints — callers then get
+    a clean 503 from Envoy instead of a DNS or routing failure.
     """
-    endpoints_map: dict[str, list[dict]] = {}
-    try:
-        cm_services = _list_cloudmap_service_ids()
-    except Exception:
-        logger.exception("Failed to list AWS Cloud Map services")
-        return endpoints_map
+    service_ids = {
+        svc["Name"]: svc["Id"]
+        for svc in _paginate(
+            sd_client, "list_services", "Services",
+            Filters=[{"Name": "NAMESPACE_ID", "Values": [CLOUDMAP_NAMESPACE_ID]}],
+        )
+    }
 
-    for name in service_names:
-        sid = cm_services.get(name)
-        if not sid:
-            logger.warning("Service %s not found in AWS Cloud Map", name)
-            endpoints_map[name] = []
-            continue
-        try:
-            endpoints_map[name] = _list_instances(sid)
-            logger.info("Discovered %d endpoints for %s", len(endpoints_map[name]), name)
-        except Exception:
-            logger.exception("Failed to list instances for %s (id=%s)", name, sid)
-            endpoints_map[name] = []
+    def instances_of(name: str) -> list[dict]:
+        service_id = service_ids.get(name)
+        if not service_id:
+            # Registered but ECS has not placed a task yet. An empty list is
+            # the right answer, not an error.
+            logger.warning("Service %s is registered but not yet in AWS Cloud Map", name)
+            return []
+        return [
+            {
+                "ip": attrs["AWS_INSTANCE_IPV4"],
+                "port": int(attrs.get("AWS_INSTANCE_PORT", DEFAULT_APP_PORT)),
+                "az": attrs.get("AVAILABILITY_ZONE", "unknown"),
+            }
+            for inst in _paginate(sd_client, "list_instances", "Instances", ServiceId=service_id)
+            if (attrs := inst.get("Attributes", {})).get("AWS_INSTANCE_IPV4")
+        ]
 
-    return endpoints_map
+    return dict(zip(service_names, _in_parallel(instances_of, service_names)))
 
 
 # ---------------------------------------------------------------------------
 # Config generation & upload
 # ---------------------------------------------------------------------------
 
-def generate_and_upload(registry: dict) -> None:
-    """Generate xDS configs for every service and the edge proxy."""
-    services = registry.get("services", {})
-    if not services:
-        logger.warning("Service registry is empty – nothing to generate")
-        return
 
-    all_service_names = list(services.keys())
+def generate_and_upload(service_names: list[str]) -> None:
+    """Write the mesh's Envoy config to S3.
 
-    # Discover endpoints for every service.
-    endpoints_map = discover_endpoints(all_service_names)
+    Three files for the whole mesh, however many services it holds.
+    
+    That falls out of the mesh being fully connected: every proxy wants a
+    cluster for every service, so every proxy wants the same config. Giving
+    each service its own copy would mean building and uploading N copies of
+    an N-service config on every change — quadratic work to express a fact
+    that fits in one file. The edge proxy reads the same three files; it is
+    not a special case either.
 
-    # Both sidecar proxies and the edge proxy use the exact same xDS config
-    # shape (CDS + EDS + LDS + RDS). The only difference is the dependency list:
-    # a sidecar only knows about the services its app calls (a subset), while
-    # the edge proxy knows about all services (so it can route external traffic
-    # to any of them). This lets us use one function for both cases.
-    def _upload_service_configs(name, deps, s3_prefix):
-        dep_endpoints = {dep: endpoints_map.get(dep, []) for dep in deps}
-        _upload_if_changed(f"{s3_prefix}/cds.yaml", build_clusters_config(deps, dep_endpoints))
-        _upload_if_changed(f"{s3_prefix}/eds.yaml", build_eds_config(dep_endpoints))
-        _upload_if_changed(f"{s3_prefix}/lds.yaml", build_listeners_config(name))
-        _upload_if_changed(f"{s3_prefix}/rds.yaml", build_routes_config(deps, MESH_DOMAIN))
+    A proxy's identity is not in here. It arrives through the bootstrap,
+    which stamps mesh.service on every metric.
+    """
+    endpoints = discover_endpoints(service_names)
 
-    # ---- Per-service sidecar configs ----
-    for svc_name, svc_info in services.items():
-        deps = svc_info.get("dependencies", [])
-        _upload_service_configs(svc_name, deps, f"services/{svc_name}")
-
-    # ---- Edge proxy configs (identical shape, all services as deps) ----
-    _upload_service_configs("edge-proxy", all_service_names, "edge-proxy")
+    files = [
+        ("mesh/cds.yaml", build_clusters_config(service_names, endpoints)),
+        ("mesh/lds.yaml", build_listeners_config()),
+        ("mesh/rds.yaml", build_routes_config(service_names, MESH_DOMAIN)),
+    ]
+    written = _in_parallel(lambda f: _upload_if_changed(*f), files)
+    logger.info("Wrote %d of %d xDS files for %d services",
+                sum(written), len(files), len(service_names))
 
 
 # ---------------------------------------------------------------------------
@@ -221,29 +204,36 @@ def generate_and_upload(registry: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def handler(event, context):
-    """AWS Lambda entry point (invoked by EventBridge on a schedule).
+    """Regenerate every service's Envoy config from the current state.
 
-    EventBridge's minimum schedule rate is 1 minute, but we want endpoint
-    updates roughly every 10 seconds for fast scaling response. To work
-    around this, the AWS Lambda function loops internally — each invocation runs multiple
-    discovery-and-upload cycles, sleeping 10s between them, until the
-    remaining execution time drops below 15s. This gives us ~5 cycles per
-    1-minute invocation without needing a long-running process.
+    One pass per invocation, and the same pass whatever woke it up. There are
+    three triggers, and none of them need handling differently because the
+    function doesn't read the event at all — it re-derives the whole mesh
+    from the registry and AWS Cloud Map every time:
+
+      - ECS task state changes, which is what actually moves endpoints
+        around. A deployment, a scale-out, a host failure: ECS emits an
+        event, and the new task IPs are in Cloud Map by the time we look.
+      - Registry writes, so a newly created service gets config immediately
+        instead of waiting for anything.
+      - A one-minute schedule, as a backstop for a dropped event.
+
+    Deriving everything rather than applying a delta is what keeps this
+    simple: it makes the function idempotent, which is what lets all three
+    triggers share one code path and lets a missed event cost nothing but
+    latency.
     """
-    if not S3_BUCKET:
-        raise RuntimeError("S3_BUCKET environment variable is required")
-    if not CLOUDMAP_NAMESPACE_ID:
-        raise RuntimeError("CLOUDMAP_NAMESPACE_ID environment variable is required")
+    for name, value in [
+        ("S3_BUCKET", S3_BUCKET),
+        ("CLOUDMAP_NAMESPACE_ID", CLOUDMAP_NAMESPACE_ID),
+        ("REGISTRY_TABLE", REGISTRY_TABLE),
+    ]:
+        if not value:
+            raise RuntimeError(f"{name} environment variable is required")
 
-    cycles = 0
-    while context.get_remaining_time_in_millis() > 15_000:
-        try:
-            registry = read_service_registry()
-            if registry:
-                generate_and_upload(registry)
-                cycles += 1
-        except Exception:
-            logger.exception("Error in transformer cycle")
-        time.sleep(10)
-
-    return {"statusCode": 200, "body": f"Completed {cycles} cycles"}
+    services = read_service_registry()
+    # No early return for an empty registry: that is a real state, reached by
+    # deleting the last service, and it has to be written out. Skipping it
+    # would leave the deleted service's cluster in S3 indefinitely.
+    generate_and_upload(sorted(services))
+    return {"statusCode": 200, "body": f"generated config for {len(services)} services"}

@@ -18,7 +18,7 @@ xDS overview (see https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_proto
 # ---------------------------------------------------------------------------
 # CDS – Cluster Discovery Service
 #
-# A "cluster" in Envoy is a logical upstream service.  Each dependency in
+# A "cluster" in Envoy is a logical upstream service.  Each target service in
 # the mesh becomes a cluster.  We use EDS (Endpoint Discovery Service) type
 # so that endpoints are loaded from a separate file and can be updated
 # independently of the cluster definition.
@@ -60,25 +60,24 @@ def _build_locality_endpoints(endpoints):
     return locality_endpoints
 
 
-def build_cluster(dependency_name, endpoints, connect_timeout="0.25s"):
-    """STATIC cluster with endpoints embedded via load_assignment.
+def build_cluster(service_name, endpoints, connect_timeout="0.25s"):
+    """STATIC cluster with its endpoints inline.
 
-    We embed endpoints directly in the CDS rather than using a separate EDS
-    file because Envoy's filesystem-based EDS (path_config_source inside
-    eds_cluster_config) does not reliably reload on file changes. By using
-    STATIC clusters with load_assignment, the endpoints are part of the CDS
-    file itself — when the CDS file is atomically replaced (mv), Envoy
-    reloads both the cluster definitions and their endpoints in one shot.
+    The endpoints live in the cluster definition rather than in an EDS
+    resource because Envoy's filesystem EDS (path_config_source inside
+    eds_cluster_config) does not reliably reload when the file changes.
+    Inline endpoints arrive with the cluster, so a CDS reload is all it
+    takes for a new task IP to be in service.
     """
     return {
         # Envoy v3 protobuf type URL — tells Envoy how to deserialize this resource
         "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
-        "name": dependency_name,
+        "name": service_name,
         "connect_timeout": connect_timeout,
         "type": "STATIC",
         "lb_policy": "ROUND_ROBIN",
         "load_assignment": {
-            "cluster_name": dependency_name,
+            "cluster_name": service_name,
             "endpoints": _build_locality_endpoints(endpoints),
         },
     }
@@ -102,11 +101,11 @@ def _passthrough_cluster():
     }
 
 
-def build_clusters_config(dependencies, endpoints_map):
-    """Full CDS response — one STATIC cluster per dependency, plus a passthrough cluster."""
+def build_clusters_config(targets, endpoints_map):
+    """Full CDS response — one STATIC cluster per target service, plus a passthrough cluster."""
     resources = [
-        build_cluster(dep, endpoints_map.get(dep, []))
-        for dep in dependencies
+        build_cluster(target, endpoints_map.get(target, []))
+        for target in targets
     ]
     # The passthrough cluster handles any traffic that doesn't match a
     # mesh service, forwarding it to the original destination.
@@ -116,47 +115,6 @@ def build_clusters_config(dependencies, endpoints_map):
         "resources": resources,
     }
 
-
-# ---------------------------------------------------------------------------
-# EDS – Endpoint Discovery Service
-#
-# Provides the actual IP addresses for each cluster.  Endpoints are grouped
-# by availability zone ("locality") so Envoy can prefer same-zone backends,
-# reducing cross-AZ data transfer costs and latency.
-# ---------------------------------------------------------------------------
-
-def build_eds_config(endpoints_map):
-    """Build an EDS response from a map of service -> endpoint list.
-
-    *endpoints_map* has the shape::
-
-        {
-            "service-b": [
-                {"ip": "10.0.1.5", "port": 8080, "az": "us-west-2a"},
-                ...
-            ]
-        }
-
-    Each entry becomes a ``ClusterLoadAssignment`` — the EDS resource that
-    maps a cluster name to its backends.  Endpoints are grouped by AZ so
-    Envoy's zone-aware load balancing can prefer same-zone backends.
-
-    Note: This EDS file is written to S3 alongside the CDS, but the CDS
-    uses STATIC clusters with embedded load_assignment rather than
-    referencing this file.  The EDS file is kept for observability and
-    debugging (operators can inspect it to see current endpoint state).
-    """
-    resources = []
-    for service_name, endpoints in endpoints_map.items():
-        resources.append({
-            "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
-            "cluster_name": service_name,
-            "endpoints": _build_locality_endpoints(endpoints),
-        })
-    return {
-        "version_info": "1",
-        "resources": resources,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -196,16 +154,20 @@ def _http_connection_manager(stat_prefix, rds_route_name):
     }
 
 
-def build_listener(service_name):
+def build_listener():
     """Listener on 0.0.0.0:15000 with HTTP connection manager.
 
     Port 15000 serves dual purpose:
       - Sidecar: iptables redirects all outbound TCP here
       - Edge proxy: NLB forwards external traffic here
+
+    Nothing here is per-service. Which service a proxy belongs to is already
+    stamped on every metric it emits, by the mesh.service stats tag the
+    bootstrap sets.
     """
     return {
         "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
-        "name": f"{service_name}_listener",
+        "name": "mesh_listener",
         "address": {
             "socket_address": {"address": "0.0.0.0", "port_value": 15000}  # nosec B104 - Envoy must bind all interfaces for iptables interception
         },
@@ -217,18 +179,18 @@ def build_listener(service_name):
         "filter_chains": [
             {
                 "filters": [
-                    _http_connection_manager(f"{service_name}_http", "egress_route")
+                    _http_connection_manager("mesh_http", "egress_route")
                 ]
             }
         ],
     }
 
 
-def build_listeners_config(service_name):
+def build_listeners_config():
     """Full LDS response."""
     return {
         "version_info": "1",
-        "resources": [build_listener(service_name)],
+        "resources": [build_listener()],
     }
 
 
@@ -237,11 +199,11 @@ def build_listeners_config(service_name):
 #
 # Routes match incoming requests by Host header and forward them to the
 # appropriate cluster.  Both sidecars and the edge proxy use the same
-# routing scheme: one virtual host per dependency matching its mesh hostname.
+# routing scheme: one virtual host per target service, matching its mesh hostname.
 # ---------------------------------------------------------------------------
 
-def build_egress_route(dependencies, mesh_domain):
-    """Route config with one virtual host per dependency service.
+def build_egress_route(targets, mesh_domain):
+    """Route config with one virtual host per target service.
 
     Each virtual host matches the service's mesh hostname (e.g.
     ``predict.demo.mesh``).  We also match with a wildcard port suffix
@@ -250,14 +212,14 @@ def build_egress_route(dependencies, mesh_domain):
     ``host:port`` as different domains.
     """
     virtual_hosts = []
-    for dep in dependencies:
+    for target in targets:
         virtual_hosts.append({
-            "name": dep,
-            "domains": [f"{dep}.{mesh_domain}", f"{dep}.{mesh_domain}:*"],
+            "name": target,
+            "domains": [f"{target}.{mesh_domain}", f"{target}.{mesh_domain}:*"],
             "routes": [
                 {
                     "match": {"prefix": "/"},
-                    "route": {"cluster": dep},
+                    "route": {"cluster": target},
                 }
             ],
         })
@@ -284,9 +246,9 @@ def build_egress_route(dependencies, mesh_domain):
     }
 
 
-def build_routes_config(dependencies, mesh_domain):
+def build_routes_config(targets, mesh_domain):
     """Full RDS response."""
     return {
         "version_info": "1",
-        "resources": [build_egress_route(dependencies, mesh_domain)],
+        "resources": [build_egress_route(targets, mesh_domain)],
     }

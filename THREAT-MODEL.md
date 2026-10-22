@@ -37,7 +37,7 @@ This document identifies trust boundaries, attack surfaces, threat scenarios, an
 ```
 
 ### Boundary 1: External clients → NLB
-- Untrusted traffic from the internet enters via the NLB
+- Traffic from elsewhere in the VPC enters via the NLB
 - The NLB forwards to the edge proxy Envoy on port 15000
 
 ### Boundary 2: Edge proxy → Mesh services
@@ -53,7 +53,7 @@ This document identifies trust boundaries, attack surfaces, threat scenarios, an
 
 | Component | Exposure | Ports |
 |-----------|----------|-------|
-| NLB | Internet-facing | Per-service ports (e.g., 8080) |
+| NLB | Internal (VPC only) | Per-service ports (e.g., 8080) |
 | Edge proxy Envoy | Via NLB only | 15000 (listener), 9901 (admin) |
 | Mesh service Envoy sidecars | VPC-internal | 15000, 9901 |
 | App containers | VPC-internal | App port (e.g., 8080) |
@@ -68,7 +68,7 @@ This document identifies trust boundaries, attack surfaces, threat scenarios, an
 
 **Threat:** An external attacker sends requests to the NLB with crafted Host headers to reach internal services.
 
-**Likelihood:** Medium — the NLB is internet-facing.
+**Likelihood:** Low — the NLB is internal, so a caller must already be inside the VPC.
 
 **Impact:** Access to any service registered in the mesh.
 

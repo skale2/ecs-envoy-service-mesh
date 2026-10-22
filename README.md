@@ -6,6 +6,10 @@ A working demo of an Envoy-based service mesh on Amazon ECS (EC2 launch type). D
 - **Edge proxy** (standalone Envoy behind an NLB) for external traffic into the mesh
 - **xDS control plane** (AWS Lambda + EventBridge) generating Envoy configs from AWS Cloud Map
 - **Uniform DNS addressing** — callers use `{service}.{prefix}.mesh` whether inside or outside the mesh
+- **Service API** — a REST endpoint (`POST /services/{name}`) that onboards new mesh services at runtime, no CDK required
+- **Load testing** — `POST /load/{target}` holds a fixed TPS against any service, using [Fortio](https://github.com/fortio/fortio)
+- **DynamoDB service registry** — one table both entrypoints write to and the control plane reads
+- **Three config files for the whole mesh** — the mesh is fully connected, so every proxy reads the same CDS/LDS/RDS
 
 ## How It Works
 
@@ -87,6 +91,45 @@ curl http://predict.demo.mesh:8080/health
 curl http://features.demo.mesh:8080/call/predict
 ```
 
+## Creating Services from the Command Line
+
+`scripts/mesh.sh` wraps the API, so no hand-written `awscurl` is needed. It works in bash and zsh, and needs `awscurl` plus credentials for the mesh account.
+
+```bash
+source scripts/mesh.sh
+
+mesh create checkout               # the Python sample app; returns once it is routable
+mesh exec checkout curl -s http://predict.demo.mesh:8080/call/features
+mesh list
+mesh delete checkout
+```
+
+`mesh create <name> perf` runs a [Fortio](https://github.com/fortio/fortio) echo server instead, and `mesh create <name> <image-uri>` runs your own image. Run `mesh help` for the full list.
+
+## Load Testing
+
+A load test is a Fortio load generator running as a mesh service, `<target>-load`, with its own Envoy sidecar, so its requests take the same path real traffic does. It holds the requested TPS until it is deleted, and reports achieved TPS, latency percentiles and errors every 30 seconds.
+
+```bash
+mesh create perf1 perf
+mesh load create perf1 2000 --delay 50 --resp 1024    # 2000 TPS, 50 ms server time, 1 KB responses
+mesh load watch perf1
+mesh load delete perf1
+```
+
+`--delay` and `--resp` set the server's latency and response size on every request, which only a `perf` target honours. `--req` sends a request body of that size, and `--path` loads a specific route, e.g. `mesh load create features 100 --path /call/predict` for a two-hop chain.
+
+Measured on t3.xlarge with 1 KB responses, one load generator against one Fortio task:
+
+| Target TPS | p50, 0 ms delay | p99, 0 ms delay | p50, 50 ms delay | p99, 50 ms delay | Errors |
+|---|---|---|---|---|---|
+| 1,000 | 1.4 ms | 4.6 ms | 55.5 ms | 59.9 ms | 0 |
+| 2,000 | 1.5 ms | 7.6 ms | 55.6 ms | 68.3 ms | 0 |
+| 4,000 | 1.7 ms | 13.7 ms | 56.5 ms | 87.9 ms | 0 |
+| 8,000 | 4.6 ms | 71.6 ms | — | — | 0 |
+
+The limit is the load generator's own Envoy sidecar (about 2 cores at 4,000 TPS); the Fortio server uses about half a core at that rate.
+
 ## Architecture
 
 ```
@@ -132,15 +175,22 @@ curl http://features.demo.mesh:8080/call/predict
 │           ├── mesh.ts          Mesh construct (cluster, control plane, edge proxy)
 │           ├── mesh-service.ts  Per-service construct (app + sidecar + DNS)
 │           ├── mesh-config.ts   Shared config interface
-│           ├── mesh-control-plane.ts   AWS Cloud Map, Amazon Route 53, Amazon S3, AWS Lambda
+│           ├── mesh-control-plane.ts   AWS Cloud Map, Amazon Route 53, Amazon S3, DynamoDB, AWS Lambda
+│           ├── mesh-service-api.ts     API Gateway + AWS Lambda (REST entrypoint)
 │           └── mesh-edge-proxy.ts      NLB + standalone Envoy
+├── service-api/                 REST entrypoint (Python AWS Lambda)
+│   ├── handler.py               Registry writes + CloudFormation CreateStack per service
+│   ├── service-template.json    Pre-synthesized template behind POST /services/{name}
+│   └── load-template.json       Pre-synthesized template behind POST /load/{target}
 ├── xds-transformer/             xDS config generator (Python AWS Lambda)
-│   ├── transformer.py           Reads AWS Cloud Map, writes CDS/EDS/LDS/RDS to Amazon S3
+│   ├── transformer.py           Reads the registry + AWS Cloud Map, writes CDS/LDS/RDS to Amazon S3
 │   └── envoy_config.py          Envoy v3 API config builders
 ├── envoy-sidecar/               Single Docker image for sidecar + edge proxy
 │   ├── entrypoint.sh            iptables setup, Amazon S3 fetch, bootstrap, Envoy launch
 │   └── Dockerfile
-└── sample-services/service/     Generic demo HTTP service (identity via env vars)
+└── sample-services/
+    ├── demo/                    Python sample app (identity via env vars)
+    └── perf/                    Fortio: perf target and load generator
 ```
 
 ## Cleanup

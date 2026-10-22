@@ -1,0 +1,489 @@
+{
+  "Parameters": {
+    "Target": {
+      "Type": "String",
+      "AllowedPattern": "[a-z][a-z0-9-]{1,30}"
+    },
+    "MeshclusterName": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/clusterName",
+      "Description": "Resolved from SSM parameter /demo-mesh/clusterName"
+    },
+    "MeshtaskSgId": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/taskSgId",
+      "Description": "Resolved from SSM parameter /demo-mesh/taskSgId"
+    },
+    "MeshprivateSubnets": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/privateSubnets",
+      "Description": "Resolved from SSM parameter /demo-mesh/privateSubnets"
+    },
+    "MeshexecutionRoleArn": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/executionRoleArn",
+      "Description": "Resolved from SSM parameter /demo-mesh/executionRoleArn"
+    },
+    "MeshtaskRoleArn": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/taskRoleArn",
+      "Description": "Resolved from SSM parameter /demo-mesh/taskRoleArn"
+    },
+    "MeshxdsBucket": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/xdsBucket",
+      "Description": "Resolved from SSM parameter /demo-mesh/xdsBucket"
+    },
+    "MeshhostedZoneId": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/hostedZoneId",
+      "Description": "Resolved from SSM parameter /demo-mesh/hostedZoneId"
+    },
+    "MeshmeshDomain": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/meshDomain",
+      "Description": "Resolved from SSM parameter /demo-mesh/meshDomain"
+    },
+    "MeshnlbDns": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/nlbDns",
+      "Description": "Resolved from SSM parameter /demo-mesh/nlbDns"
+    },
+    "MeshnlbHostedZoneId": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/nlbHostedZoneId",
+      "Description": "Resolved from SSM parameter /demo-mesh/nlbHostedZoneId"
+    },
+    "MeshnamespaceId": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/namespaceId",
+      "Description": "Resolved from SSM parameter /demo-mesh/namespaceId"
+    },
+    "MeshenvoyImageUri": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/envoyImageUri",
+      "Description": "Resolved from SSM parameter /demo-mesh/envoyImageUri"
+    },
+    "MeshregistryTable": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/registryTable",
+      "Description": "Resolved from SSM parameter /demo-mesh/registryTable"
+    },
+    "MeshregistryWriterArn": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/registryWriterArn",
+      "Description": "Resolved from SSM parameter /demo-mesh/registryWriterArn"
+    },
+    "ImageUri": {
+      "Type": "String"
+    },
+    "TargetPort": {
+      "Type": "Number",
+      "Default": 8080,
+      "MaxValue": 65535,
+      "MinValue": 0
+    },
+    "Tps": {
+      "Type": "Number",
+      "MaxValue": 20000,
+      "MinValue": 1
+    },
+    "DelayMs": {
+      "Type": "Number",
+      "Default": 0,
+      "MaxValue": 10000,
+      "MinValue": 0
+    },
+    "ResponseBytes": {
+      "Type": "Number",
+      "Default": 0,
+      "MaxValue": 262144,
+      "MinValue": 0
+    },
+    "RequestBytes": {
+      "Type": "Number",
+      "Default": 0,
+      "MaxValue": 262144,
+      "MinValue": 0
+    },
+    "Path": {
+      "Type": "String",
+      "Default": "/",
+      "AllowedPattern": "/[A-Za-z0-9/._-]*"
+    }
+  },
+  "Resources": {
+    "ServiceLogs205D48C6": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Join": [
+            "",
+            [
+              "/ecs/",
+              {
+                "Ref": "MeshmeshDomain"
+              },
+              "/",
+              {
+                "Ref": "Target"
+              },
+              "-load"
+            ]
+          ]
+        },
+        "RetentionInDays": 7
+      },
+      "UpdateReplacePolicy": "Delete",
+      "DeletionPolicy": "Delete"
+    },
+    "ServiceTaskDef1922A00F": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "ContainerDefinitions": [
+          {
+            "Cpu": 256,
+            "DependsOn": [
+              {
+                "Condition": "HEALTHY",
+                "ContainerName": "envoy"
+              }
+            ],
+            "Environment": [
+              {
+                "Name": "APP_PORT",
+                "Value": "8080"
+              },
+              {
+                "Name": "SERVICE_NAME",
+                "Value": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Ref": "Target"
+                      },
+                      "-load"
+                    ]
+                  ]
+                }
+              },
+              {
+                "Name": "MESH_DOMAIN",
+                "Value": {
+                  "Ref": "MeshmeshDomain"
+                }
+              },
+              {
+                "Name": "LOAD_TARGET",
+                "Value": {
+                  "Ref": "Target"
+                }
+              },
+              {
+                "Name": "TARGET_PORT",
+                "Value": {
+                  "Ref": "TargetPort"
+                }
+              },
+              {
+                "Name": "TPS",
+                "Value": {
+                  "Ref": "Tps"
+                }
+              },
+              {
+                "Name": "DELAY_MS",
+                "Value": {
+                  "Ref": "DelayMs"
+                }
+              },
+              {
+                "Name": "RESPONSE_BYTES",
+                "Value": {
+                  "Ref": "ResponseBytes"
+                }
+              },
+              {
+                "Name": "REQUEST_BYTES",
+                "Value": {
+                  "Ref": "RequestBytes"
+                }
+              },
+              {
+                "Name": "LOAD_PATH",
+                "Value": {
+                  "Ref": "Path"
+                }
+              },
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              }
+            ],
+            "Essential": true,
+            "HealthCheck": {
+              "Command": [
+                "CMD-SHELL",
+                "curl -fsS http://localhost:8080/health || exit 1"
+              ],
+              "Interval": 5,
+              "Retries": 6,
+              "StartPeriod": 60,
+              "Timeout": 3
+            },
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "LinuxParameters": {
+              "Capabilities": {},
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "ServiceLogs205D48C6"
+                },
+                "awslogs-stream-prefix": "app",
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                }
+              }
+            },
+            "Memory": 256,
+            "Name": "app",
+            "PortMappings": [
+              {
+                "ContainerPort": 8080,
+                "Protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "Cpu": 256,
+            "Environment": [
+              {
+                "Name": "S3_BUCKET",
+                "Value": {
+                  "Ref": "MeshxdsBucket"
+                }
+              },
+              {
+                "Name": "SERVICE_NAME",
+                "Value": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Ref": "Target"
+                      },
+                      "-load"
+                    ]
+                  ]
+                }
+              },
+              {
+                "Name": "SIDECAR",
+                "Value": "1"
+              },
+              {
+                "Name": "APP_PORT",
+                "Value": "8080"
+              },
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              }
+            ],
+            "Essential": true,
+            "HealthCheck": {
+              "Command": [
+                "CMD-SHELL",
+                "curl -fsS http://localhost:9901/ready | grep -q LIVE || exit 1"
+              ],
+              "Interval": 5,
+              "Retries": 6,
+              "StartPeriod": 120,
+              "Timeout": 3
+            },
+            "Image": {
+              "Ref": "MeshenvoyImageUri"
+            },
+            "LinuxParameters": {
+              "Capabilities": {
+                "Add": [
+                  "NET_ADMIN",
+                  "NET_RAW"
+                ]
+              },
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "ServiceLogs205D48C6"
+                },
+                "awslogs-stream-prefix": "envoy",
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                }
+              }
+            },
+            "Memory": 256,
+            "Name": "envoy",
+            "PortMappings": [
+              {
+                "ContainerPort": 15000,
+                "Protocol": "tcp"
+              },
+              {
+                "ContainerPort": 9901,
+                "Protocol": "tcp"
+              }
+            ]
+          },
+          {
+            "Cpu": 64,
+            "Environment": [
+              {
+                "Name": "CW_CONFIG_CONTENT",
+                "Value": "{\"metrics\":{\"namespace\":\"/ecs/envoy-mesh/StatsD\",\"metrics_collected\":{\"statsd\":{\"service_address\":\":8126\",\"metrics_aggregation_interval\":60}}}}"
+              },
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              }
+            ],
+            "Essential": false,
+            "Image": "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest",
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "ServiceLogs205D48C6"
+                },
+                "awslogs-stream-prefix": "cw-agent",
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                }
+              }
+            },
+            "Memory": 128,
+            "Name": "cw-agent",
+            "PortMappings": [
+              {
+                "ContainerPort": 8126,
+                "Protocol": "udp"
+              }
+            ]
+          }
+        ],
+        "ExecutionRoleArn": {
+          "Ref": "MeshexecutionRoleArn"
+        },
+        "Family": "MeshLoadTemplateServiceTaskDefBEAF4ECC",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "EC2"
+        ],
+        "TaskRoleArn": {
+          "Ref": "MeshtaskRoleArn"
+        }
+      }
+    },
+    "ServiceCloudMapService0DE797A5": {
+      "Type": "AWS::ServiceDiscovery::Service",
+      "Properties": {
+        "Name": {
+          "Fn::Join": [
+            "",
+            [
+              {
+                "Ref": "Target"
+              },
+              "-load"
+            ]
+          ]
+        },
+        "NamespaceId": {
+          "Ref": "MeshnamespaceId"
+        }
+      }
+    },
+    "ServiceD69D759B": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "MeshclusterName"
+        },
+        "DeploymentConfiguration": {
+          "MaximumPercent": 200,
+          "MinimumHealthyPercent": 100
+        },
+        "DesiredCount": 1,
+        "EnableExecuteCommand": true,
+        "LaunchType": "EC2",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "SecurityGroups": [
+              {
+                "Ref": "MeshtaskSgId"
+              }
+            ],
+            "Subnets": {
+              "Fn::Split": [
+                ",",
+                {
+                  "Ref": "MeshprivateSubnets"
+                }
+              ]
+            }
+          }
+        },
+        "ServiceName": {
+          "Fn::Join": [
+            "-",
+            [
+              "service",
+              {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Ref": "Target"
+                    },
+                    "-load"
+                  ]
+                ]
+              }
+            ]
+          ]
+        },
+        "ServiceRegistries": [
+          {
+            "RegistryArn": {
+              "Fn::GetAtt": [
+                "ServiceCloudMapService0DE797A5",
+                "Arn"
+              ]
+            }
+          }
+        ],
+        "TaskDefinition": {
+          "Ref": "ServiceTaskDef1922A00F"
+        }
+      },
+      "DependsOn": [
+        "ServiceCloudMapService0DE797A5"
+      ]
+    }
+  }
+}

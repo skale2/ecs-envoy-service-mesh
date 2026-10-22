@@ -104,17 +104,16 @@ s3_download() {
     aws s3 cp "${s3_uri}" "${tmp}" --region "${AWS_REGION}" && mv -f "${tmp}" "${dest}"
 }
 
-# --- Determine S3 prefix based on mode ---
-if [ "${SIDECAR}" = "1" ]; then
-    S3_PREFIX="services/${SERVICE_NAME}"
-else
-    S3_PREFIX="edge-proxy"
-fi
+# --- Config location ---
+# One config set for the whole mesh. Sidecars and the edge proxy read the
+# same files: the mesh is fully connected, so every proxy needs a cluster for
+# every service, which makes every proxy's config identical. This proxy's own
+# identity comes from SERVICE_NAME in the bootstrap, not from its config.
+S3_PREFIX="mesh"
 
 # --- Fetch xDS configs from S3 with retry logic ---
 fetch_configs() {
     s3_download "s3://${S3_BUCKET}/${S3_PREFIX}/cds.yaml" "${CONFIG_DIR}/cds.yaml" && \
-    s3_download "s3://${S3_BUCKET}/${S3_PREFIX}/eds.yaml" "${CONFIG_DIR}/eds.yaml" && \
     s3_download "s3://${S3_BUCKET}/${S3_PREFIX}/lds.yaml" "${CONFIG_DIR}/lds.yaml" && \
     s3_download "s3://${S3_BUCKET}/${S3_PREFIX}/rds.yaml" "${CONFIG_DIR}/rds.yaml"
 }
@@ -139,7 +138,7 @@ if [ ${RETRY_COUNT} -ge ${MAX_RETRIES} ]; then
     echo "WARNING: Could not fetch xDS configs from S3 after ${MAX_RETRIES} attempts."
     echo "Starting with empty stub configs. The refresh loop will pick up real configs once available."
 
-    for file in cds.yaml eds.yaml lds.yaml rds.yaml; do
+    for file in cds.yaml lds.yaml rds.yaml; do
         if [ ! -f "${CONFIG_DIR}/${file}" ]; then
             echo "version_info: '0'" > "${CONFIG_DIR}/${file}"
             echo "resources: []" >> "${CONFIG_DIR}/${file}"
@@ -155,8 +154,10 @@ fi
 # path for atomic moves (mv); when the background refresh loop below
 # replaces a file, Envoy detects the inode change and hot-reloads.
 #
-# EDS and RDS are loaded indirectly: CDS clusters reference an EDS file,
-# and LDS listeners reference an RDS file, both via path_config_source.
+# RDS is loaded indirectly: the HTTP connection manager inside lds.yaml
+# references rds.yaml via path_config_source. There is no EDS file — the
+# clusters are STATIC with their endpoints inline, because Envoy's
+# filesystem EDS does not reliably reload when the file changes.
 # =============================================================================
 echo "Generating Envoy bootstrap configuration..."
 cat > "${CONFIG_DIR}/envoy.yaml" <<EOF
@@ -232,7 +233,7 @@ refresh_one_file() {
 refresh_configs_loop() {
     while true; do
         sleep 5
-        for file in cds.yaml eds.yaml lds.yaml rds.yaml; do
+        for file in cds.yaml lds.yaml rds.yaml; do
             refresh_one_file "${S3_PREFIX}/${file}" "${CONFIG_DIR}/${file}"
         done
     done

@@ -6,7 +6,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "cdk": "cdk"
+    "cdk": "cdk",
+    "synth:templates": "npx ts-node --prefer-ts-exts bin/templates.ts"
   },
   "dependencies": {
     "aws-cdk-lib": "^2.170.0",

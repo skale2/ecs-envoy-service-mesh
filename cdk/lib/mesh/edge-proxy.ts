@@ -3,13 +3,22 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
-import { MeshConfig } from './mesh-config';
-import { ENVOY_LISTENER_PORT, ENVOY_ADMIN_PORT } from './mesh-constants';
+import { ENVOY_LISTENER_PORT, ENVOY_ADMIN_PORT } from './constants';
 
 export interface MeshEdgeProxyProps {
-  meshConfig: MeshConfig;
   vpc: ec2.IVpc;
+  cluster: ecs.ICluster;
+  namespace: servicediscovery.INamespace;
+  taskSecurityGroup: ec2.ISecurityGroup;
+  executionRole: iam.IRole;
+  taskRole: iam.IRole;
+  xdsBucketName: string;
+  envoyImage: ecr_assets.DockerImageAsset;
+  logGroup: logs.ILogGroup;
 }
 
 /**
@@ -30,7 +39,7 @@ export class MeshEdgeProxy extends Construct {
   constructor(scope: Construct, id: string, props: MeshEdgeProxyProps) {
     super(scope, id);
 
-    const { meshConfig: mesh } = props;
+    const mesh = props;
     const region = cdk.Stack.of(this).region;
 
     // Edge proxy task definition: Envoy only, no app container, no iptables.
@@ -39,20 +48,20 @@ export class MeshEdgeProxy extends Construct {
     const taskDef = new ecs.Ec2TaskDefinition(this, 'TaskDef', {
       networkMode: ecs.NetworkMode.AWS_VPC,
       executionRole: mesh.executionRole,
-      taskRole: mesh.envoyTaskRole,
+      taskRole: mesh.taskRole,
     });
 
     const envoyLinuxParams = new ecs.LinuxParameters(this, 'EnvoyLinuxParams', {
       initProcessEnabled: true,
     });
     taskDef.addContainer('envoy', {
-      image: ecs.ContainerImage.fromDockerImageAsset(mesh.envoySidecarImage),
+      image: ecs.ContainerImage.fromDockerImageAsset(mesh.envoyImage),
       essential: true,
       memoryLimitMiB: 512,
       cpu: 512,
       linuxParameters: envoyLinuxParams,
       environment: {
-        S3_BUCKET: mesh.xdsBucket.bucketName,
+        S3_BUCKET: mesh.xdsBucketName,
         SERVICE_NAME: 'edge-proxy',
         // SIDECAR='0' tells the entrypoint script to skip iptables setup.
         // The edge proxy receives traffic directly on its listener port
@@ -78,7 +87,7 @@ export class MeshEdgeProxy extends Construct {
       // root privileges. The entrypoint skips iptables when SIDECAR='0',
       // so running as non-root from the start is safe.
       user: '101',
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'edge-proxy-envoy' }),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'envoy', logGroup: mesh.logGroup }),
     });
 
     // CloudWatch agent: receives DogStatsD metrics from Envoy on UDP 8126
@@ -96,7 +105,7 @@ export class MeshEdgeProxy extends Construct {
       cpu: 64,
       environment: { CW_CONFIG_CONTENT: cwAgentConfig },
       portMappings: [{ containerPort: 8126, protocol: ecs.Protocol.UDP }],
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'edge-proxy-cw-agent' }),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cw-agent', logGroup: mesh.logGroup }),
     });
 
     // AWS Cloud Map service for API-based discovery (HTTP namespace, no DNS)
@@ -117,21 +126,18 @@ export class MeshEdgeProxy extends Construct {
     });
     this.ecsService.associateCloudMapService({ service: cmService });
 
-    // Allow NLB traffic into task security group
-    const sg = mesh.taskSecurityGroup as ec2.SecurityGroup;
-    sg.addIngressRule(
-      ec2.Peer.anyIpv4(), ec2.Port.tcp(ENVOY_LISTENER_PORT),
-      'Allow NLB traffic to edge proxy on Envoy port',
-    );
-    sg.addIngressRule(
-      ec2.Peer.anyIpv4(), ec2.Port.tcp(ENVOY_ADMIN_PORT),
-      'Allow NLB health checks on admin port',
-    );
-
-    // Network Load Balancer -- the single entry point for external traffic.
+    // Network Load Balancer -- the mesh's entry point for callers that are in
+    // the VPC but not in the mesh (no sidecar, no iptables).
+    //
+    // Internal, so the alias records in the private hosted zone resolve to
+    // private addresses that such a caller can actually reach. It also means
+    // every client is VPC-local, which is why no security group rule here
+    // opens anything: the task security group's intra-VPC rule already
+    // admits both the NLB's traffic and its health checks. Nothing about the
+    // mesh is reachable from the internet.
     this.nlb = new elbv2.NetworkLoadBalancer(this, 'Nlb', {
       vpc: props.vpc,
-      internetFacing: true,
+      internetFacing: false,
       crossZoneEnabled: true,
       // AZ affinity: prefer routing clients to edge proxy tasks in the same
       // AZ, reducing cross-AZ hops and latency. Envoy then does its own

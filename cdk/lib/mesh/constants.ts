@@ -12,5 +12,6 @@ export const DEFAULT_APP_PORT = 8080;
 /** CloudWatch agent StatsD port — receives DogStatsD metrics from Envoy over UDP. */
 export const CLOUDWATCH_STATSD_PORT = 8126;
 
-/** Envoy runs as this UID. iptables rules use --uid-owner to skip Envoy's own traffic. */
-export const ENVOY_UID = 101;
+/** CloudWatch agent image, used by every mesh task to ship Envoy's metrics. */
+export const CLOUDWATCH_AGENT_IMAGE =
+  'public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest';

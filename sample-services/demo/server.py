@@ -18,60 +18,44 @@ Key mesh interaction:
 import http.server
 import json
 import os
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 
 PORT = int(os.environ.get("APP_PORT", "8080"))
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "unknown")
-# Comma-separated list of downstream services to call, e.g. "service-b.mesh.local:8080"
-DOWNSTREAM_TARGETS = os.environ.get("DOWNSTREAM_TARGETS", "")
-
-
-def _parse_targets():
-    if not DOWNSTREAM_TARGETS.strip():
-        return {}
-    targets = {}
-    for entry in DOWNSTREAM_TARGETS.split(","):
-        entry = entry.strip()
-        host_port = entry.rsplit(":", 1)
-        host = host_port[0]
-        port = host_port[1] if len(host_port) > 1 else "8080"
-        # Derive a short name for the URL path (e.g. "service-b.mesh.local" → "service-b")
-        short = host.split(".")[0]
-        targets[short] = f"http://{host}:{port}"
-    return targets
-
-
-TARGETS = _parse_targets()
+# The mesh is fully connected, so there is no list of downstream services to
+# configure. Any service is reachable at {name}.{MESH_DOMAIN} — that
+# convention is the whole addressing scheme.
+MESH_DOMAIN = os.environ.get("MESH_DOMAIN", "demo.mesh")
+DEFAULT_TARGET_PORT = os.environ.get("DEFAULT_TARGET_PORT", "8080")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/health":
+        path = urllib.parse.urlsplit(self.path).path  # route on the path, not the query
+        if path == "/health":
             self._respond(200, {"service": SERVICE_NAME, "status": "healthy"})
-        elif self.path == "/":
+        elif path == "/":
             self._respond(200, {
                 "service": SERVICE_NAME,
                 "message": f"Hello from {SERVICE_NAME}!",
-                "downstream_targets": list(TARGETS.keys()) or None,
             })
-        elif self.path.startswith("/call/"):
-            target_name = self.path[len("/call/"):].strip("/")
+        elif path.startswith("/call/"):
+            target_name = path[len("/call/"):].strip("/")
             self._call_downstream(target_name)
         else:
             self._respond(404, {"error": "not found"})
 
     def _call_downstream(self, target_name):
-        base_url = TARGETS.get(target_name)
-        if not base_url:
-            self._respond(400, {
-                "service": SERVICE_NAME,
-                "error": f"Unknown target '{target_name}'. Available: {list(TARGETS.keys())}",
-            })
-            return
+        # No lookup table: a mesh service's address is just its name plus the
+        # mesh domain. This is the one line that shows what the mesh buys you
+        # — the app opens a plain HTTP connection to a hostname and never
+        # learns that Envoy, iptables, or task IPs exist.
+        base_url = f"http://{target_name}.{MESH_DOMAIN}:{DEFAULT_TARGET_PORT}"
         try:
             req = urllib.request.Request(f"{base_url}/")
-            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 - scheme is always http, constructed in _parse_targets()
+            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 - scheme is hardcoded http
                 body = json.loads(resp.read().decode())
                 self._respond(200, {
                     "service": SERVICE_NAME,
