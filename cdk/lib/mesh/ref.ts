@@ -11,6 +11,8 @@ import { Construct } from 'constructs';
  */
 export const MESH_REF_FIELDS = [
   'clusterName',       // ECS cluster name
+  'capacityProvider',  // places tasks, and grows the fleet when they don't fit
+  'vpcId',             // the mesh's VPC, for an NLB service's target group
   'taskSgId',          // security group for awsvpc tasks
   'privateSubnets',    // comma-separated private subnet IDs
   'executionRoleArn',  // task execution role (image pull, log creation)

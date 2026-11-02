@@ -5,6 +5,16 @@
       "Default": "/demo-mesh/clusterName",
       "Description": "Resolved from SSM parameter /demo-mesh/clusterName"
     },
+    "MeshcapacityProvider": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/capacityProvider",
+      "Description": "Resolved from SSM parameter /demo-mesh/capacityProvider"
+    },
+    "MeshvpcId": {
+      "Type": "AWS::SSM::Parameter::Value<String>",
+      "Default": "/demo-mesh/vpcId",
+      "Description": "Resolved from SSM parameter /demo-mesh/vpcId"
+    },
     "MeshtaskSgId": {
       "Type": "AWS::SSM::Parameter::Value<String>",
       "Default": "/demo-mesh/taskSgId",
@@ -88,7 +98,7 @@
     "DesiredCount": {
       "Type": "Number",
       "Default": 1,
-      "MaxValue": 10,
+      "MaxValue": 200,
       "MinValue": 0
     }
   },
@@ -226,12 +236,6 @@
                 "Value": "1"
               },
               {
-                "Name": "APP_PORT",
-                "Value": {
-                  "Ref": "AppPort"
-                }
-              },
-              {
                 "Name": "AWS_REGION",
                 "Value": {
                   "Ref": "AWS::Region"
@@ -351,6 +355,14 @@
     "ServiceD69D759B": {
       "Type": "AWS::ECS::Service",
       "Properties": {
+        "CapacityProviderStrategy": [
+          {
+            "CapacityProvider": {
+              "Ref": "MeshcapacityProvider"
+            },
+            "Weight": 1
+          }
+        ],
         "Cluster": {
           "Ref": "MeshclusterName"
         },
@@ -362,7 +374,6 @@
           "Ref": "DesiredCount"
         },
         "EnableExecuteCommand": true,
-        "LaunchType": "EC2",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
             "SecurityGroups": [

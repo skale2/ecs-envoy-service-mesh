@@ -38,14 +38,14 @@ export class ServiceMeshStack extends cdk.Stack {
       ],
     });
 
-    // The two sample apps: "demo" is the Python app the services below run,
-    // "perf" is Fortio, which serves as both perf target and load generator.
-    // Declared before the Mesh so their layers can be warmed onto each
-    // instance at boot along with the mesh's own images.
+    // The two sample images: "demo" is the Go app every service runs by
+    // default, "load" is the Fortio load generator. Declared before the Mesh
+    // so their layers can be warmed onto each instance at boot along with the
+    // mesh's own images.
     const image = (app: string) => new ecr_assets.DockerImageAsset(this, `${app}Image`, {
       directory: path.join(projectRoot, 'sample-services', app),
     }).imageUri;
-    const images = { demo: image('demo'), perf: image('perf') };
+    const images = { demo: image('demo'), load: image('load') };
     // -------------------------------------------------------
     // Mesh (cluster, control plane, edge proxy)
     // -------------------------------------------------------
@@ -69,6 +69,10 @@ export class ServiceMeshStack extends cdk.Stack {
       // creating a service never waits for an instance to boot, which is
       // otherwise 2-4 minutes on the critical path. Drop it back to 2 when
       // not rehearsing.
+      //
+      // Past those 150 tasks, ECS managed scaling grows the fleet towards
+      // maxCapacity as tasks fail to fit, which is what a large load test or
+      // a scaled-out service waits on. 200 instances is 600 tasks.
       //
       // Fargate would delete this entire consideration, and is not available:
       // the sidecar needs NET_ADMIN to install iptables rules.
@@ -99,6 +103,7 @@ export class ServiceMeshStack extends cdk.Stack {
     // callers without CDK.
     // -------------------------------------------------------
     new MeshServiceApi(this, 'ServiceApi', {
+      vpc,
       xdsBucket: mesh.xdsBucket,
       registryTable: mesh.registryTable,
       mesh: mesh.ref,

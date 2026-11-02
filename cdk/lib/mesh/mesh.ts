@@ -67,6 +67,7 @@ export class Mesh extends Construct {
   public readonly registryTable: dynamodb.Table;
   /** What a MeshService needs from this mesh. Also what gets exported. */
   public readonly ref: MeshRef;
+  public readonly capacityProvider: ecs.AsgCapacityProvider;
 
   private readonly _edgeProxy: MeshEdgeProxy;
 
@@ -152,11 +153,17 @@ export class Mesh extends Construct {
       vpc,
       clusterName: `${props.prefix}-envoy-mesh`,
     });
-    const capacityProvider = new ecs.AsgCapacityProvider(this, 'AsgCapacityProvider', {
+    // Every service places its tasks through this capacity provider, which
+    // is what lets the fleet grow: when a task can't be placed (on t3.xlarge
+    // the limit is 3 awsvpc tasks per instance, by ENIs), ECS managed scaling
+    // adds instances, up to the group's maxCapacity, and drains them again as
+    // tasks go away. A service pinned to launchType EC2 instead would leave
+    // its extra tasks pending on a full fleet.
+    this.capacityProvider = new ecs.AsgCapacityProvider(this, 'AsgCapacityProvider', {
       autoScalingGroup: asg,
       enableManagedTerminationProtection: false,
     });
-    this.cluster.addAsgCapacityProvider(capacityProvider);
+    this.cluster.addAsgCapacityProvider(this.capacityProvider);
 
     // Task security group (shared by all awsvpc tasks)
     const taskSg = new ec2.SecurityGroup(this, 'TaskSg', {
@@ -231,6 +238,7 @@ export class Mesh extends Construct {
     this._edgeProxy = new MeshEdgeProxy(this, 'EdgeProxy', {
       vpc,
       cluster: this.cluster,
+      capacityProvider: this.capacityProvider.capacityProviderName,
       namespace: controlPlane.namespace,
       taskSecurityGroup: taskSg,
       executionRole,
@@ -279,6 +287,8 @@ export class Mesh extends Construct {
     // -------------------------------------------------------
     this.ref = {
       clusterName: this.cluster.clusterName,
+      capacityProvider: this.capacityProvider.capacityProviderName,
+      vpcId: vpc.vpcId,
       taskSgId: taskSg.securityGroupId,
       privateSubnets: vpc.selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS })
         .subnetIds.join(','),

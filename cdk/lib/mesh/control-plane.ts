@@ -24,9 +24,10 @@ export interface MeshControlPlaneProps {
 }
 
 /**
- * The mesh control plane: AWS Cloud Map namespace (API-only), Amazon Route 53
- * hosted zone for service DNS, Amazon S3 xDS config bucket, and an AWS Lambda
- * function scheduled via EventBridge that generates xDS configs.
+ * The mesh control plane: an AWS Cloud Map namespace that ECS registers tasks
+ * in, the service registry, the Amazon Route 53 zone for service names, the
+ * Amazon S3 bucket Envoy's config lives in, and the AWS Lambda function that
+ * writes it.
  */
 export class MeshControlPlane extends Construct {
   public readonly namespace: servicediscovery.HttpNamespace;
@@ -42,30 +43,25 @@ export class MeshControlPlane extends Construct {
 
     const { vpc } = props;
 
-    // AWS Cloud Map HTTP namespace (API-only, no DNS records).
-    // An HTTP namespace, which is API-only: it creates no DNS records. That
-    // matters because mesh DNS belongs to the Route 53 zone below, and a
-    // Cloud Map DNS namespace of the same name would compete with it. Cloud
-    // Map's job here is purely to hold task IPs for the transformer to read.
+    // An HTTP namespace, which is API-only: it creates no DNS records. Mesh
+    // DNS belongs to the Route 53 zone below, and a Cloud Map DNS namespace of
+    // the same name would compete with it. Cloud Map's job here is only to
+    // hold task IPs for the transformer to read.
     this.namespace = new servicediscovery.HttpNamespace(this, 'Namespace', {
       name: props.meshDomain,
     });
 
-    // Amazon Route 53 private hosted zone for service DNS resolution.
-    // Each MeshService creates an alias record (e.g. service-b.mesh.local)
-    // pointing to the edge proxy NLB. This makes service names resolvable
-    // from anywhere in the VPC.
+    // The private zone service names resolve in, from anywhere in the VPC. The
+    // mesh puts one wildcard record in it, pointing at the edge proxy's NLB;
+    // see Mesh.
     this.hostedZone = new route53.PrivateHostedZone(this, 'HostedZone', {
       zoneName: props.meshDomain,
       vpc,
     });
 
-    // S3 bucket for xDS configs.
-    // Versioning is enabled so that Envoy sidecars can use the S3 eTag
-    // (which changes on every object version) to detect config updates.
-    // The sidecar's refresh loop calls HeadObject, compares the eTag to
-    // the last-seen value, and only downloads when it differs -- avoiding
-    // unnecessary disk writes that would trigger unnecessary Envoy reloads.
+    // The bucket Envoy's config lives in. Proxies poll it with conditional
+    // GETs (If-None-Match on the object's ETag), so an unchanged file costs a
+    // 304 and no download. See envoy-sidecar/refresh.py.
     const xdsAccessLogBucket = new s3.Bucket(this, 'XdsAccessLogBucket', {
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -87,13 +83,11 @@ export class MeshControlPlane extends Construct {
 
     // Service registry.
     //
-    // This is the list of services the mesh is supposed to have: name, port,
-    // and port. It is deliberately NOT in the xDS bucket.
-    // The xDS bucket holds generated Envoy config, which has to be files
-    // because Envoy's filesystem xDS API reads files; the registry is
-    // mutable metadata that the API writes and the transformer reads, which
-    // is a table's job. Keeping them apart means a write to the registry
-    // can't scribble on the config Envoy is mid-reload on.
+    // The list of services the mesh is supposed to have: name, port, and how
+    // callers reach it. It is not in the xDS bucket: that holds generated
+    // Envoy config, which has to be files because Envoy reads files, while
+    // the registry is mutable metadata that the API writes and the
+    // transformer reads, which is a table's job.
     //
     // On-demand billing, because the whole point of the API entrypoint is
     // that a room full of people can create services at once and nobody has
@@ -173,10 +167,10 @@ export class MeshControlPlane extends Construct {
     this.xdsBucket.grantRead(this.envoyTaskRole);
 
     // The control plane, such as it is: one Lambda that reads the registry
-    // and AWS Cloud Map and writes Envoy's CDS/LDS/RDS files to S3. There
-    // is no xDS server, no gRPC stream, and nothing running between
-    // invocations — Envoy reads its config off a filesystem that a sidecar
-    // keeps in sync with the bucket.
+    // and AWS Cloud Map and writes Envoy's four config files to S3. There is
+    // no xDS server, no gRPC stream, and nothing running between invocations:
+    // Envoy reads its config off a filesystem that each proxy keeps in step
+    // with the bucket.
     const projectRoot = path.join(__dirname, '..', '..', '..');
     const transformerFn = new lambda.Function(this, 'TransformerFn', {
       runtime: lambda.Runtime.PYTHON_3_11,
@@ -191,11 +185,10 @@ export class MeshControlPlane extends Construct {
         },
       }),
       timeout: cdk.Duration.minutes(2),
-      // Lambda allocates vCPU in proportion to memory, and this function is
-      // the opposite of memory-hungry: it wants cores. It fans a few thousand
-      // AWS calls across a thread pool and serializes a YAML document per
-      // proxy per config type, so both the waiting and the work parallelize.
-      // 1769 MB is where a function gets a full vCPU; this is roughly 2.3.
+      // Lambda allocates vCPU in proportion to memory, and this function
+      // wants cores, not memory: it fans a few thousand AWS calls across a
+      // thread pool and serializes the mesh's config to YAML. 1769 MB is
+      // where a function gets a full vCPU; this is roughly 2.3.
       //
       // Being generous here is cheap precisely because of the concurrency
       // limit below: only one of these ever runs, for a few seconds at a time.
@@ -215,7 +208,6 @@ export class MeshControlPlane extends Construct {
       environment: {
         S3_BUCKET: this.xdsBucket.bucketName,
         CLOUDMAP_NAMESPACE_ID: this.namespace.namespaceId,
-        CLOUDMAP_NAMESPACE_NAME: props.meshDomain,
         MESH_DOMAIN: props.meshDomain,
         REGISTRY_TABLE: this.registryTable.tableName,
       },

@@ -10,6 +10,8 @@ export interface MeshRegistryEntryProps {
   serviceName: string;
   /** Application port, as a string. May be a CloudFormation token. */
   port: string;
+  /** More string attributes for the row, e.g. how the service is reached. */
+  attributes?: Record<string, string>;
 }
 
 /**
@@ -44,7 +46,11 @@ export class MeshRegistryEntry extends Construct {
 
     const put = sdkCall('putItem', {
       TableName: props.tableName,
-      Item: { ...key, port: { N: props.port } },
+      Item: {
+        ...key,
+        port: { N: props.port },
+        ...Object.fromEntries(Object.entries(props.attributes ?? {}).map(([k, v]) => [k, { S: v }])),
+      },
     });
 
     this.resource = new cdk.CfnResource(this, 'Resource', {

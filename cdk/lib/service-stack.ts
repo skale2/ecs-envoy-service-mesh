@@ -2,8 +2,14 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { MeshService, meshRefFromSsm, DEFAULT_APP_PORT } from './mesh';
 
+export interface ServiceStackProps extends cdk.StackProps {
+  /** Envoy sidecar (the default) or an NLB in front; see MeshServiceProps. */
+  proxy?: 'envoy' | 'nlb';
+}
+
 /**
- * The per-service CloudFormation template behind `POST /services`.
+ * The per-service CloudFormation template behind `POST /services`, in two
+ * variants: Envoy-sidecar services, and NLB-fronted ones to compare against.
  *
  * Synthesized once at build time (`npm run synth:templates`); the
  * resulting service-template.json is what the service API's Lambda hands to
@@ -15,7 +21,7 @@ import { MeshService, meshRefFromSsm, DEFAULT_APP_PORT } from './mesh';
  * CDK app uses, so the two entrypoints cannot drift apart.
  */
 export class ServiceStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: ServiceStackProps) {
     super(scope, id, {
       ...props,
       synthesizer: new cdk.BootstraplessSynthesizer(),
@@ -38,8 +44,10 @@ export class ServiceStack extends cdk.Stack {
     const appPort = new cdk.CfnParameter(this, 'AppPort', {
       type: 'Number', default: DEFAULT_APP_PORT, minValue: 1, maxValue: 65535,
     });
+    // Changed in place by PATCH /services/{name}. 200 tasks is a third of the
+    // fleet's ceiling (200 instances x 3 tasks), so one service can't take it all.
     const desiredCount = new cdk.CfnParameter(this, 'DesiredCount', {
-      type: 'Number', default: 1, minValue: 0, maxValue: 10,
+      type: 'Number', default: 1, minValue: 0, maxValue: 200,
     });
 
     new MeshService(this, 'Service', {
@@ -48,6 +56,7 @@ export class ServiceStack extends cdk.Stack {
       appImage: imageUri.valueAsString,
       appPort: appPort.valueAsNumber,
       desiredCount: desiredCount.valueAsNumber,
+      proxy: props?.proxy,
     });
 
     new cdk.CfnOutput(this, 'ServiceHostname', {

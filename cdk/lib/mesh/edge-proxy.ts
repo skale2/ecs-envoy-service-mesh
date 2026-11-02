@@ -7,11 +7,12 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
-import { ENVOY_LISTENER_PORT, ENVOY_ADMIN_PORT } from './constants';
+import { ENVOY_LISTENER_PORT, ENVOY_ADMIN_PORT, CLOUDWATCH_STATSD_PORT, CLOUDWATCH_AGENT_IMAGE } from './constants';
 
 export interface MeshEdgeProxyProps {
   vpc: ec2.IVpc;
   cluster: ecs.ICluster;
+  capacityProvider: string;
   namespace: servicediscovery.INamespace;
   taskSecurityGroup: ec2.ISecurityGroup;
   executionRole: iam.IRole;
@@ -74,9 +75,8 @@ export class MeshEdgeProxy extends Construct {
         { containerPort: ENVOY_ADMIN_PORT },
       ],
       healthCheck: {
-        // Envoy's admin interface exposes /ready, which returns "LIVE"
-        // when the proxy is initialized and ready to accept traffic.
-        command: ['CMD-SHELL', 'curl -s http://localhost:9901/ready | grep -q LIVE || exit 1'],
+        // Envoy's admin /ready answers LIVE once it is initialized.
+        command: ['CMD-SHELL', `curl -s http://localhost:${ENVOY_ADMIN_PORT}/ready | grep -q LIVE || exit 1`],
         interval: cdk.Duration.seconds(30),
         timeout: cdk.Duration.seconds(5),
         retries: 3,
@@ -90,21 +90,21 @@ export class MeshEdgeProxy extends Construct {
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'envoy', logGroup: mesh.logGroup }),
     });
 
-    // CloudWatch agent: receives DogStatsD metrics from Envoy on UDP 8126
+    // CloudWatch agent: receives DogStatsD metrics from Envoy over UDP.
     const cwAgentConfig = JSON.stringify({
       metrics: {
         namespace: '/ecs/envoy-mesh/StatsD',
         metrics_collected: {
-          statsd: { service_address: ':8126', metrics_aggregation_interval: 60 },
+          statsd: { service_address: `:${CLOUDWATCH_STATSD_PORT}`, metrics_aggregation_interval: 60 },
         },
       },
     });
     taskDef.addContainer('cw-agent', {
-      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest'),
+      image: ecs.ContainerImage.fromRegistry(CLOUDWATCH_AGENT_IMAGE),
       memoryLimitMiB: 128,
       cpu: 64,
       environment: { CW_CONFIG_CONTENT: cwAgentConfig },
-      portMappings: [{ containerPort: 8126, protocol: ecs.Protocol.UDP }],
+      portMappings: [{ containerPort: CLOUDWATCH_STATSD_PORT, protocol: ecs.Protocol.UDP }],
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cw-agent', logGroup: mesh.logGroup }),
     });
 
@@ -119,6 +119,7 @@ export class MeshEdgeProxy extends Construct {
       serviceName: 'edge-proxy',
       taskDefinition: taskDef,
       desiredCount: 1,
+      capacityProviderStrategies: [{ capacityProvider: mesh.capacityProvider, weight: 1 }],
       enableExecuteCommand: true,
       minHealthyPercent: 100,
       maxHealthyPercent: 200,

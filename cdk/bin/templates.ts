@@ -16,6 +16,7 @@ import { LoadStack } from '../lib/load-stack';
 const app = new cdk.App();
 const templates = {
   'service-template.json': new ServiceStack(app, 'MeshServiceTemplate'),
+  'nlb-service-template.json': new ServiceStack(app, 'MeshNlbServiceTemplate', { proxy: 'nlb' }),
   'load-template.json': new LoadStack(app, 'MeshLoadTemplate'),
 };
 const assembly = app.synth();

@@ -3,6 +3,7 @@ import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as path from 'path';
@@ -10,6 +11,8 @@ import { Construct } from 'constructs';
 import { MeshRef } from '../mesh';
 
 export interface MeshServiceApiProps {
+  /** The mesh's VPC, which GET /graph runs inside. */
+  vpc: ec2.IVpc;
   /** Bucket the pre-synthesized templates are uploaded to. */
   xdsBucket: s3.IBucket;
   /** Service registry table, read to answer GET /services. */
@@ -21,8 +24,8 @@ export interface MeshServiceApiProps {
   /** Roles the templates attach to task definitions; CloudFormation needs
    *  iam:PassRole on them. */
   passRoleArns: string[];
-  /** Images behind the "demo" and "perf" shortcuts. */
-  images: { demo: string; perf: string };
+  /** The default service image ("demo") and the load generator image. */
+  images: { demo: string; load: string };
 }
 
 /**
@@ -46,17 +49,19 @@ export class MeshServiceApi extends Construct {
       prune: false,
     });
 
+    const code = lambda.Code.fromAsset(apiDir, { exclude: ['*-template.json'] });
     const fn = new lambda.Function(this, 'Handler', {
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: 'handler.handler',
-      code: lambda.Code.fromAsset(apiDir, { exclude: ['*-template.json'] }),
+      code,
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: {
         SERVICE_TEMPLATE_URL: props.xdsBucket.urlForObject('service-api/service-template.json'),
+        NLB_SERVICE_TEMPLATE_URL: props.xdsBucket.urlForObject('service-api/nlb-service-template.json'),
         LOAD_TEMPLATE_URL: props.xdsBucket.urlForObject('service-api/load-template.json'),
         DEMO_IMAGE: props.images.demo,
-        PERF_IMAGE: props.images.perf,
+        LOAD_IMAGE: props.images.load,
         REGISTRY_TABLE: props.registryTable.tableName,
         CLUSTER: props.mesh.clusterName,
         MESH_DOMAIN: props.mesh.meshDomain,
@@ -68,13 +73,13 @@ export class MeshServiceApi extends Construct {
     const allow = (actions: string[], resources: string[]) =>
       fn.addToRolePolicy(new iam.PolicyStatement({ actions, resources }));
 
-    // Create and delete service and load-test stacks, and nothing else.
-    allow(['cloudformation:CreateStack', 'cloudformation:DeleteStack'], ['mesh-svc-*', 'mesh-load-*']
+    // Create, scale and delete service and load-test stacks, and nothing else.
+    allow(['cloudformation:CreateStack', 'cloudformation:UpdateStack', 'cloudformation:DeleteStack'], ['mesh-svc-*', 'mesh-load-*']
       .map(resourceName => stack.formatArn({
         service: 'cloudformation', resource: 'stack', resourceName,
         arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
       })));
-    allow(['cloudformation:DescribeStacks', 'cloudformation:ListStacks'], ['*']);
+    allow(['cloudformation:DescribeStacks', 'cloudformation:ListStacks', 'cloudformation:GetTemplateSummary'], ['*']);
 
     // CloudFormation runs those templates with this role's identity, so it
     // needs everything their resources do across create and delete, including
@@ -90,6 +95,21 @@ export class MeshServiceApi extends Construct {
       'logs:PutRetentionPolicy', 'logs:TagResource', 'logs:UntagResource',
       'logs:ListTagsForResource',
     ], ['*']);
+    // ...and, for a service fronted by an NLB, the load balancer and the
+    // record that points the service's name at it.
+    allow([
+      'elasticloadbalancing:CreateLoadBalancer', 'elasticloadbalancing:DeleteLoadBalancer',
+      'elasticloadbalancing:ModifyLoadBalancerAttributes',
+      'elasticloadbalancing:CreateTargetGroup', 'elasticloadbalancing:DeleteTargetGroup',
+      'elasticloadbalancing:ModifyTargetGroup', 'elasticloadbalancing:ModifyTargetGroupAttributes',
+      'elasticloadbalancing:CreateListener', 'elasticloadbalancing:DeleteListener', 'elasticloadbalancing:ModifyListener',
+      'elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags', 'elasticloadbalancing:Describe*',
+      'ec2:DescribeSubnets', 'ec2:DescribeVpcs', 'ec2:DescribeSecurityGroups', 'ec2:DescribeInternetGateways',
+      'ec2:DescribeAccountAttributes', 'ec2:DescribeNetworkInterfaces', 'ec2:DescribeAddresses',
+    ], ['*']);
+    allow(['route53:GetHostedZone', 'route53:ChangeResourceRecordSets', 'route53:ListResourceRecordSets'],
+      [`arn:${stack.partition}:route53:::hostedzone/${props.mesh.hostedZoneId}`]);
+    allow(['route53:GetChange'], [`arn:${stack.partition}:route53:::change/*`]);
     allow(['iam:PassRole'], props.passRoleArns);
     allow(['ssm:GetParameters'], [stack.formatArn({
       service: 'ssm', resource: 'parameter', resourceName: `${props.prefix}-mesh/*`,
@@ -131,7 +151,30 @@ export class MeshServiceApi extends Construct {
       return item;
     };
 
-    crud('services', 'name').addResource('execute').addMethod('POST', integration);
+    const service = crud('services', 'name');
+    service.addMethod('PATCH', integration);
+    service.addResource('execute').addMethod('POST', integration);
     crud('load', 'target');
+
+    // GET /graph reads every task's Envoy admin endpoint, which is reachable
+    // only from inside the VPC, so this function runs there.
+    const graph = new lambda.Function(this, 'Graph', {
+      runtime: lambda.Runtime.PYTHON_3_11,
+      handler: 'graph.handler',
+      code,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 512,
+      vpc: props.vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      environment: { NAMESPACE_ID: props.mesh.namespaceId, REGISTRY_TABLE: props.registryTable.tableName },
+    });
+    graph.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['servicediscovery:ListServices', 'servicediscovery:ListInstances'],
+      resources: ['*'],
+    }));
+    // Which services run without a sidecar, and so report their calls from
+    // the app instead of from Envoy.
+    props.registryTable.grantReadData(graph);
+    this.api.root.addResource('graph').addMethod('GET', new apigw.LambdaIntegration(graph));
   }
 }

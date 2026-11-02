@@ -9,7 +9,8 @@
 # entirely, or set MESH_STACK if the stack has another name. Every command
 # exports AWS_REGION=us-west-2 (or MESH_REGION, if set).
 
-_MESH_USAGE='mesh create <name> [demo|perf|<image-uri>] [--port N] [--no-wait]
+_MESH_USAGE='mesh create <name> [demo|<image-uri>] [--tasks N] [--port N] [--nlb] [--no-wait]
+mesh scale  <name> <tasks> [--no-wait]
 mesh list
 mesh get    <name>
 mesh delete <name>
@@ -21,8 +22,11 @@ mesh load get    <target>
 mesh load watch  <target>
 mesh load delete <target>
 
-  demo  the Python sample app (default)
-  perf  a Fortio echo server, which honours --delay and --resp from a load test'
+  demo     the sample app (default)
+  --tasks  up to 200; the fleet adds instances when tasks do not fit
+  --nlb    no Envoy sidecar: the service gets an NLB of its own, to compare against
+  <tps>    up to 1,000,000; split across as many load tasks as it takes
+  --path   a route like /call/b/c loads a chain: target -> b -> c'
 
 # Look up the API URL once and export it. This has to run in the caller's own
 # shell: inside $(...) or a pipeline the assignment would be made in a
@@ -77,14 +81,15 @@ _mesh_load_table() {
 d = json.load(sys.stdin)
 if "windows" not in d:
     sys.exit("mesh: " + str(d.get("error") or d.get("message") or d))
-row = "  {:9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}"
+row = "  {:9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7} {:>6}"
 if sys.argv[1] == "1":
-    print("{service} -> {target}  {tps} TPS  delay {delayMs}ms  req {requestBytes}B  resp {responseBytes}B  {path}  {status}".format(**d))
-    print(row.format("window", "achieved", "p50", "p90", "p99", "p99.9", "errors"))
+    d.setdefault("tasks", 1)
+    print("{service} -> {target}  {tps} TPS on {tasks} tasks  delay {delayMs}ms  req {requestBytes}B  resp {responseBytes}B  {path}  {status}".format(**d))
+    print(row.format("window", "achieved", "p50", "p90", "p99", "p99.9", "errors", "tasks"))
 for w in d["windows"]:
     if w["at"] > sys.argv[2]:
         ms = ["{}ms".format(w[k]) for k in ("p50Ms", "p90Ms", "p99Ms", "p999Ms")]
-        print(row.format(w["at"][11:19], w["achievedTps"], *ms, w["errors"]))' "$1" "${2:-}"
+        print(row.format(w["at"][11:19], w["achievedTps"], *ms, w["errors"], w.get("tasks", 1)))' "$1" "${2:-}"
 }
 
 # _mesh_wait <what> <check...>: run the check every 5s until it succeeds.
@@ -108,6 +113,13 @@ _mesh_service_ready() {
   _mesh_request GET "/services/$1" 2>/dev/null | grep -q '"status": "READY"'
 }
 
+# Done once the service runs exactly $2 tasks.
+_mesh_service_scaled() {
+  _mesh_request GET "/services/$1" 2>/dev/null | python3 -c 'import json, sys
+t = json.load(sys.stdin).get("tasks") or {}
+sys.exit(0 if t.get("desired") == t.get("running") == int(sys.argv[1]) else 1)' "$2"
+}
+
 # Done waiting once results arrive, or once there's no point: a failed stack
 # will never produce any.
 _mesh_load_settled() {
@@ -127,20 +139,31 @@ mesh() {
 
   case "$cmd" in
     create)
-      local name="${1:?usage: mesh create <name> [demo|perf|<image-uri>] [--port N] [--no-wait]}"
-      local image="" port="" wait=1
+      local name="${1:?usage: mesh create <name> [demo|<image-uri>] [--tasks N] [--port N] [--nlb] [--no-wait]}"
+      local image="" tasks="" port="" proxy="" wait=1
       shift
       while [ $# -gt 0 ]; do
         case "$1" in
+          --tasks) tasks="$2"; shift 2 ;;
           --port) port="$2"; shift 2 ;;
+          --nlb) proxy=nlb; shift ;;
           --no-wait) wait=0; shift ;;
           -*) echo "mesh create: unknown option $1" >&2; return 2 ;;
           *) image="$1"; shift ;;
         esac
       done
-      _mesh_request POST "/services/$name" "$(_mesh_json image "$image" port "$port")" \
+      _mesh_request POST "/services/$name" "$(_mesh_json image "$image" tasks "$tasks" port "$port" proxy "$proxy")" \
         | _mesh_pretty || return 1
       [ "$wait" = 0 ] || _mesh_wait "$name" _mesh_service_ready "$name"
+      ;;
+
+    scale)
+      local usage='usage: mesh scale <name> <tasks> [--no-wait]'
+      local name="${1:?$usage}" tasks="${2:?$usage}"
+      _mesh_request PATCH "/services/$name" "$(_mesh_json tasks "$tasks")" | _mesh_pretty || return 1
+      # New instances, when the fleet has to grow, take a few minutes to join.
+      [ "${3:-}" = --no-wait ] || MESH_WAIT_TIMEOUT="${MESH_WAIT_TIMEOUT:-900}" \
+        _mesh_wait "$name to run $tasks tasks" _mesh_service_scaled "$name" "$tasks"
       ;;
 
     list)   _mesh_request GET /services | _mesh_pretty ;;
