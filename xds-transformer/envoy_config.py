@@ -1,254 +1,206 @@
-"""Envoy xDS configuration builders.
+"""The mesh's Envoy config, as plain dicts in Envoy's v3 API.
 
-Generates CDS, EDS, LDS, and RDS configuration as Python dicts compatible
-with Envoy's v3 API.  These dicts are serialized to YAML and uploaded to S3
-for consumption by Envoy sidecars and the edge proxy.
+The transformer serializes these to YAML and uploads them to S3, and every
+proxy in the mesh, sidecars and the edge proxy alike, reads the same four
+files:
 
-Both sidecars and the edge proxy use identical configurations.  The listener
-is always on port 15000.  Routing is driven entirely by the Host header via
-virtual hosts in the RDS.
+    cds.yaml   clusters: one per service, and a passthrough for everything else
+    eds.yaml   endpoints: each service's tasks, grouped by zone
+    lds.yaml   the listener on :15000 that intercepted traffic arrives at
+    rds.yaml   routes: Host header -> cluster
 
-xDS overview (see https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol):
-  - CDS defines logical clusters (upstream services) and how to discover their endpoints
-  - EDS provides the actual IP:port:zone endpoints for each cluster
-  - LDS defines listeners (network entry points) and their filter chains
-  - RDS defines HTTP routing rules (virtual hosts, routes, path matching)
+The mesh is fully connected, so every proxy wants a cluster for every
+service, and nothing in these files depends on which proxy reads them. A
+proxy's own identity arrives through its bootstrap instead (see
+envoy-sidecar/entrypoint.sh).
+
+https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
 """
 
+ENVOY_PORT = 15000
+# Where each proxy keeps these files. The sidecar writes one endpoints file per
+# service under eds/, from eds.yaml; see envoy-sidecar/refresh.py.
+CONFIG_DIR = "/etc/envoy"
+
+# Envoy's defaults allow 1,024 connections and 1,024 requests in flight per
+# upstream, per proxy, and answer the rest with 503s. A sidecar holding 4,000
+# TPS against a 500 ms service needs 2,000, so the limits are raised well past
+# anything one task can generate.
+CIRCUIT_BREAKERS = {"thresholds": [{
+    "max_connections": 100000,
+    "max_pending_requests": 100000,
+    "max_requests": 100000,
+}]}
+
+
 # ---------------------------------------------------------------------------
-# CDS – Cluster Discovery Service
-#
-# A "cluster" in Envoy is a logical upstream service.  Each target service in
-# the mesh becomes a cluster.  We use EDS (Endpoint Discovery Service) type
-# so that endpoints are loaded from a separate file and can be updated
-# independently of the cluster definition.
+# CDS: clusters
 # ---------------------------------------------------------------------------
 
-def _build_locality_endpoints(endpoints):
-    """Convert a flat list of endpoints into Envoy locality-grouped format.
+def build_cluster(name):
+    """A mesh service, whose endpoints Envoy reads from a file of their own.
 
-    Groups endpoints by AZ for locality-aware load balancing, where Envoy
-    prefers sending traffic to backends in the same AZ as the caller.
-    """
-    by_zone: dict[str, list] = {}
-    for ep in endpoints:
-        az = ep.get("az", "unknown")
-        by_zone.setdefault(az, []).append(ep)
-
-    locality_endpoints = []
-    for zone, zone_eps in sorted(by_zone.items()):
-        lb_endpoints = [
-            {
-                "endpoint": {
-                    "address": {
-                        "socket_address": {
-                            "address": ep["ip"],
-                            "port_value": ep["port"],
-                        }
-                    }
-                }
-            }
-            for ep in zone_eps
-        ]
-        # Derive the AWS region from the AZ name by stripping the trailing
-        # letter (e.g. "us-west-2a" -> "us-west-2").
-        region = zone.rstrip("abcdefghijklmnopqrstuvwxyz") if zone != "unknown" else "unknown"
-        locality_endpoints.append({
-            "locality": {"region": region, "zone": zone},
-            "lb_endpoints": lb_endpoints,
-        })
-    return locality_endpoints
-
-
-def build_cluster(service_name, endpoints, connect_timeout="0.25s"):
-    """STATIC cluster with its endpoints inline.
-
-    The endpoints live in the cluster definition rather than in an EDS
-    resource because Envoy's filesystem EDS (path_config_source inside
-    eds_cluster_config) does not reliably reload when the file changes.
-    Inline endpoints arrive with the cluster, so a CDS reload is all it
-    takes for a new task IP to be in service.
+    Keeping them out of the cluster is what makes a deploy cheap: a task
+    starting or stopping changes only that file, and Envoy updates the
+    cluster's hosts in place instead of rebuilding the cluster and draining
+    its connections.
     """
     return {
-        # Envoy v3 protobuf type URL — tells Envoy how to deserialize this resource
         "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
-        "name": service_name,
-        "connect_timeout": connect_timeout,
-        "type": "STATIC",
+        "name": name,
+        "type": "EDS",
+        "eds_cluster_config": {
+            "eds_config": {"path_config_source": {"path": f"{CONFIG_DIR}/eds/{name}.yaml"}},
+        },
+        "connect_timeout": "0.25s",
         "lb_policy": "ROUND_ROBIN",
+        "circuit_breakers": CIRCUIT_BREAKERS,
+        # Zone-aware routing is on by default, but only for upstreams of 6
+        # hosts or more. A service here often has 2.
+        "common_lb_config": {"zone_aware_lb_config": {"min_cluster_size": 1}},
+    }
+
+
+def build_nlb_cluster(name, address, port):
+    """A service fronted by its own NLB instead of sidecars.
+
+    One endpoint, the NLB's DNS name, which Envoy keeps re-resolving
+    (STRICT_DNS) and balances over the addresses it gets back, one per zone.
+    The NLB picks the task. Any Envoy in the mesh can call such a service by
+    name like any other.
+    """
+    return {
+        "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+        "name": name,
+        "type": "STRICT_DNS",
+        "dns_lookup_family": "V4_ONLY",
+        "connect_timeout": "0.25s",
+        "lb_policy": "ROUND_ROBIN",
+        "circuit_breakers": CIRCUIT_BREAKERS,
         "load_assignment": {
-            "cluster_name": service_name,
-            "endpoints": _build_locality_endpoints(endpoints),
+            "cluster_name": name,
+            "endpoints": [{"lb_endpoints": [_endpoint(address, port)]}],
         },
     }
 
 
-def _passthrough_cluster():
-    """ORIGINAL_DST cluster for traffic that doesn't match any mesh service.
-
-    When a request's Host header doesn't match any virtual host in the RDS,
-    the catch-all route sends it here.  ORIGINAL_DST tells Envoy to connect
-    to whatever IP:port the client originally intended (before iptables
-    redirected it).  This lets non-mesh traffic (e.g. calls to external
-    APIs) pass through transparently.
-    """
+def build_passthrough_cluster():
+    """Where a request for anything outside the mesh goes: to the address the
+    app dialed, which iptables recorded before redirecting it (ORIGINAL_DST)."""
     return {
         "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
         "name": "passthrough",
-        "connect_timeout": "5s",
         "type": "ORIGINAL_DST",
+        "connect_timeout": "5s",
         "lb_policy": "CLUSTER_PROVIDED",
     }
 
 
-def build_clusters_config(targets, endpoints_map):
-    """Full CDS response — one STATIC cluster per target service, plus a passthrough cluster."""
-    resources = [
-        build_cluster(target, endpoints_map.get(target, []))
-        for target in targets
-    ]
-    # The passthrough cluster handles any traffic that doesn't match a
-    # mesh service, forwarding it to the original destination.
-    resources.append(_passthrough_cluster())
-    return {
-        "version_info": "1",
-        "resources": resources,
-    }
-
+def build_clusters_config(services, nlbs):
+    """cds.yaml. A service in `nlbs`, {name: (NLB DNS name, port)}, is
+    reached through its NLB; every other one through its tasks."""
+    clusters = [build_nlb_cluster(name, *nlbs[name]) if name in nlbs else build_cluster(name)
+                for name in services]
+    return {"resources": clusters + [build_passthrough_cluster()]}
 
 
 # ---------------------------------------------------------------------------
-# LDS – Listener Discovery Service
-#
-# A "listener" is a network entry point — it binds to an address:port and
-# applies a chain of filters to incoming connections.  We use a single
-# listener on port 15000 for both sidecars (receives iptables-redirected
-# traffic) and the edge proxy (receives NLB-forwarded traffic).
+# EDS: endpoints
 # ---------------------------------------------------------------------------
 
-def _http_connection_manager(stat_prefix, rds_route_name):
-    """Build an HTTP connection manager (HCM) network filter.
+def _endpoint(address, port):
+    return {"endpoint": {"address": {"socket_address": {"address": address, "port_value": port}}}}
 
-    The HCM is the L7 filter that decodes HTTP and applies routing rules.
-    It references an RDS route config by name, loaded from a local file.
-    Envoy watches the file for atomic moves and reloads automatically.
+
+def build_load_assignment(name, endpoints, region):
+    """One service's tasks, grouped by zone.
+
+    The zones are what zone-aware routing works from: each proxy compares how
+    the upstream is spread across zones with how its own service is, keeps as
+    much traffic in its zone as the upstream's share there can take, and
+    spreads the rest. The localities have to match the proxies' own exactly,
+    region included, which is why the region is passed in rather than guessed.
     """
+    by_zone = {}
+    for ep in endpoints:
+        by_zone.setdefault(ep["az"], []).append(_endpoint(ep["ip"], ep["port"]))
     return {
-        "name": "envoy.filters.network.http_connection_manager",
-        "typed_config": {
-            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-            "stat_prefix": stat_prefix,
-            "rds": {
-                "config_source": {
-                    "path_config_source": {"path": "/etc/envoy/rds.yaml"}
-                },
-                "route_config_name": rds_route_name,
-            },
-            # The Router filter is required — it actually executes the routing
-            # decision made by the HCM based on the route configuration above.
-            "http_filters": [{
-                "name": "envoy.filters.http.router", 
-                "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}
-            }],
-        },
+        "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+        "cluster_name": name,
+        "endpoints": [{"locality": {"region": region, "zone": zone}, "lb_endpoints": hosts}
+                      for zone, hosts in sorted(by_zone.items())],
     }
 
+
+def build_endpoints_config(endpoints, region):
+    """eds.yaml, from {service: [{ip, port, az}, ...]}.
+
+    Envoy reads one service's endpoints per file, so each sidecar splits this
+    into eds/<service>.yaml. A service with no tasks still gets an entry,
+    with no endpoints, so that callers get a clean 503.
+    """
+    return {"resources": [build_load_assignment(name, eps, region)
+                          for name, eps in sorted(endpoints.items())]}
+
+
+# ---------------------------------------------------------------------------
+# LDS: the listener
+# ---------------------------------------------------------------------------
 
 def build_listener():
-    """Listener on 0.0.0.0:15000 with HTTP connection manager.
-
-    Port 15000 serves dual purpose:
-      - Sidecar: iptables redirects all outbound TCP here
-      - Edge proxy: NLB forwards external traffic here
-
-    Nothing here is per-service. Which service a proxy belongs to is already
-    stamped on every metric it emits, by the mesh.service stats tag the
-    bootstrap sets.
-    """
+    """0.0.0.0:15000, where iptables sends a sidecar's outbound traffic and
+    the edge NLB sends traffic from outside the mesh."""
     return {
         "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
         "name": "mesh_listener",
-        "address": {
-            "socket_address": {"address": "0.0.0.0", "port_value": 15000}  # nosec B104 - Envoy must bind all interfaces for iptables interception
-        },
-        # use_original_dst tells Envoy to recover the original destination
-        # from SO_ORIGINAL_DST (set by iptables REDIRECT). This metadata is
-        # used by the ORIGINAL_DST passthrough cluster. When traffic wasn't
-        # redirected (e.g. edge proxy receiving from NLB), this is a no-op.
+        # nosec B104 - Envoy must bind all interfaces to receive intercepted traffic.
+        "address": {"socket_address": {"address": "0.0.0.0", "port_value": ENVOY_PORT}},
+        # Recovers the address the app dialed, which the passthrough cluster
+        # connects to. A no-op for traffic that wasn't redirected.
         "use_original_dst": True,
-        "filter_chains": [
-            {
-                "filters": [
-                    _http_connection_manager("mesh_http", "egress_route")
-                ]
-            }
-        ],
+        "filter_chains": [{"filters": [{
+            "name": "envoy.filters.network.http_connection_manager",
+            "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                "stat_prefix": "mesh_http",
+                "rds": {
+                    "config_source": {"path_config_source": {"path": f"{CONFIG_DIR}/rds.yaml"}},
+                    "route_config_name": "egress_route",
+                },
+                "http_filters": [{
+                    "name": "envoy.filters.http.router",
+                    "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"},
+                }],
+            },
+        }]}],
     }
 
 
 def build_listeners_config():
-    """Full LDS response."""
-    return {
-        "version_info": "1",
-        "resources": [build_listener()],
-    }
+    """lds.yaml."""
+    return {"resources": [build_listener()]}
 
 
 # ---------------------------------------------------------------------------
-# RDS – Route Discovery Service
-#
-# Routes match incoming requests by Host header and forward them to the
-# appropriate cluster.  Both sidecars and the edge proxy use the same
-# routing scheme: one virtual host per target service, matching its mesh hostname.
+# RDS: routes
 # ---------------------------------------------------------------------------
 
-def build_egress_route(targets, mesh_domain):
-    """Route config with one virtual host per target service.
+def build_routes_config(services, mesh_domain):
+    """rds.yaml: a virtual host per service, matched by Host header.
 
-    Each virtual host matches the service's mesh hostname (e.g.
-    ``predict.demo.mesh``).  We also match with a wildcard port suffix
-    because HTTP clients often include the port in the Host header when
-    the port is non-standard (e.g. 8080), and Envoy treats ``host`` and
-    ``host:port`` as different domains.
+    Each matches both `predict.demo.mesh` and `predict.demo.mesh:<port>`,
+    because clients include a non-standard port in the Host header and Envoy
+    treats the two as different domains. Any other host goes to the
+    passthrough cluster, so a sidecar never blocks traffic leaving the mesh.
     """
-    virtual_hosts = []
-    for target in targets:
-        virtual_hosts.append({
-            "name": target,
-            "domains": [f"{target}.{mesh_domain}", f"{target}.{mesh_domain}:*"],
-            "routes": [
-                {
-                    "match": {"prefix": "/"},
-                    "route": {"cluster": target},
-                }
-            ],
-        })
+    def virtual_host(name, domains, cluster):
+        return {"name": name, "domains": domains,
+                "routes": [{"match": {"prefix": "/"}, "route": {"cluster": cluster}}]}
 
-    # Catch-all: any Host header that doesn't match a mesh service is
-    # forwarded to the passthrough cluster, which connects to the original
-    # destination via ORIGINAL_DST.  This ensures non-mesh traffic (e.g.
-    # calls to external APIs) isn't blocked by the sidecar.
-    virtual_hosts.append({
-        "name": "passthrough",
-        "domains": ["*"],
-        "routes": [
-            {
-                "match": {"prefix": "/"},
-                "route": {"cluster": "passthrough"},
-            }
-        ],
-    })
-
-    return {
+    hosts = [virtual_host(name, [f"{name}.{mesh_domain}", f"{name}.{mesh_domain}:*"], name)
+             for name in services]
+    return {"resources": [{
         "@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
         "name": "egress_route",
-        "virtual_hosts": virtual_hosts,
-    }
-
-
-def build_routes_config(targets, mesh_domain):
-    """Full RDS response."""
-    return {
-        "version_info": "1",
-        "resources": [build_egress_route(targets, mesh_domain)],
-    }
+        "virtual_hosts": hosts + [virtual_host("passthrough", ["*"], "passthrough")],
+    }]}

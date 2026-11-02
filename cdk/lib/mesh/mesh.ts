@@ -118,6 +118,15 @@ export class Mesh extends Construct {
     // instance. The default costs a manifest round-trip and nothing more —
     // layers already on disk are not downloaded again.
     userData.addCommands('echo ECS_ENABLE_TASK_ENI_TRUNKING=true >> /etc/ecs/ecs.config');
+    // Envoy watches every file it reads with an inotify instance of its own:
+    // four, plus one per service for its endpoints. Linux allows 128 per user
+    // on a host, and every sidecar on a host runs as the same user, 101, so
+    // three sidecars in a 40-service mesh would run out, and Envoy aborts when
+    // it can't watch a file.
+    userData.addCommands(
+      'echo fs.inotify.max_user_instances=8192 > /etc/sysctl.d/90-envoy.conf',
+      'sysctl -p /etc/sysctl.d/90-envoy.conf',
+    );
 
     // Security controls (implementation priority):
     // 1. CRITICAL: IMDSv2 enforced (requireImdsv2: true) — prevents SSRF-based

@@ -1,55 +1,34 @@
-# =============================================================================
-# Envoy Sidecar / Edge Proxy Container
-#
-# Built on the official envoyproxy/envoy image, which provides a
-# production-ready Envoy binary. We extend it with iptables (for
-# transparent egress interception in sidecar mode) and the AWS CLI
-# (for pulling xDS configs from S3).
-# =============================================================================
+# One image for both roles, the sidecar and the edge proxy: the official
+# Envoy image, plus iptables for interception and a small Python process
+# that keeps the config files in step with S3.
 
-# nosec: This is the official Envoy Proxy image from Docker Hub, a public
-# CNCF project not owned by Amazon. Using upstream images for open-source
-# infrastructure components is a well-established pattern.
+# nosec: the official image of Envoy, a CNCF project.
 FROM envoyproxy/envoy:v1.36-latest
 
-# Install dependencies:
-#   - iptables: used by the entrypoint (in sidecar mode) to set up NAT rules
-#     that redirect outgoing TCP traffic to Envoy's listener port. Not needed
-#     by the edge proxy, but included so a single image serves both roles.
-#   - curl: used by ECS health checks (curl localhost:9901/ready).
-#   - AWS CLI: used to pull xDS config files from S3 at startup and in the
-#     background refresh loop.
+#   iptables, sudo   the sidecar's interception rules (the edge proxy skips them)
+#   curl             health checks, and the task's zone from ECS metadata
+#   python3-botocore refresh.py's S3 reads
+#   python3-yaml     refresh.py's split of eds.yaml into a file per service
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl \
         bash \
-        unzip \
+        curl \
         iptables \
         sudo \
-    && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
-    && unzip awscliv2.zip \
-    && ./aws/install \
-    && rm -rf awscliv2.zip aws \
-    && apt-get remove -y unzip \
-    && apt-get autoremove -y \
+        python3 \
+        python3-botocore \
+        python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /etc/envoy && chown -R 101:101 /etc/envoy
+RUN mkdir -p /etc/envoy/eds && chown -R 101:101 /etc/envoy
 
-# Give the envoy user (UID 101) passwordless sudo so it can run iptables
-# as root while the container itself runs as non-root. This mirrors the
-# pattern used in production: the process runs as a non-root user for
-# safety, but elevates briefly to set up NAT rules at startup.
+# Envoy runs as UID 101, which is also how iptables tells its traffic from the
+# app's. It needs root only for the iptables rules at startup, through sudo.
 RUN echo 'envoy ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY entrypoint.sh refresh.py /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 15000 9901
-
-# Run as the envoy user (UID 101). The iptables rules use --uid-owner 101
-# to skip Envoy's own traffic and prevent infinite redirect loops.
-# iptables commands in the entrypoint use `sudo` to elevate briefly.
 USER 101
-
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
