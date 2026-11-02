@@ -38,8 +38,8 @@ The edge proxy receives external traffic via the NLB without iptables intercepti
 Principle of least privilege is applied to:
 
 - **Envoy task role**: S3 read-only access (xDS configs), SSM for ECS Exec debugging, CloudWatch for metrics
-- **Transformer Lambda role**: `ListServices` scoped to the mesh namespace ARN, `ListInstances` scoped to account/region, S3 read/write to the xDS bucket, and read-only on the service registry table. The transformer never writes the registry; it only renders it.
-- **Service API Lambda role**: read/write on the service registry table, read-only on the xDS bucket (it only needs the per-service CloudFormation template), and CloudFormation create/delete scoped to `mesh-svc-*` stacks. The split matters: the API owns the registry and the transformer owns the generated config, so neither can corrupt the other's state.
+- **Transformer Lambda role**: Cloud Map `ListServices` and `ListInstances` (which IAM cannot scope to a namespace, so the function filters by namespace ID), S3 read/write to the xDS bucket, and read-only on the service registry table. The transformer never writes the registry; it only renders it.
+- **Service API Lambda role**: read-only on the service registry table (each service's own stack writes its row, through the mesh's custom-resource provider), read-only on the xDS bucket (it only needs the CloudFormation templates), CloudFormation create/update/delete scoped to `mesh-svc-*` and `mesh-load-*` stacks, and the permissions those templates' resources need. The split matters: services own their registry rows and the transformer owns the generated config, so neither can corrupt the other's state.
 - **ECS execution role**: Standard `AmazonECSTaskExecutionRolePolicy` for image pull and log creation
 
 ### Container Security
@@ -95,7 +95,7 @@ Principle of least privilege is applied to:
 ### Security Groups
 - One group for all awsvpc tasks, allowing intra-VPC traffic only (demo debuggability). No rule in the mesh admits traffic from outside the VPC.
 - The edge proxy needs no rule of its own. Its NLB is internal, so every client — and every health check — reaches it from a VPC-local address that the intra-VPC rule already covers.
-- Nothing opens the Envoy admin port (9901) beyond the VPC. It serves `/config_dump`, which lists every endpoint IP in the mesh, and accepts `POST /quitquitquit`, and it has no authentication of its own.
+- Envoy's admin interface, which has no authentication and can reconfigure or stop Envoy, listens on loopback only (127.0.0.1:9902). The VPC gets a read-only view on port 9901, through a listener that passes `GET /ready`, `/stats` and `/clusters` and answers anything else with 403; nothing opens 9901 beyond the VPC.
 - Production recommendation: Restrict the intra-VPC rule to specific ports — 8080 (app), 15000 (Envoy), 9901 (admin), 8126/UDP (StatsD)
 
 ## Risk Assessment
@@ -105,7 +105,7 @@ Principle of least privilege is applied to:
 
 ### Operational Risks
 - **No mTLS**: Services within the mesh communicate in plaintext. A compromised task could sniff traffic. Mitigate by enabling Envoy mTLS.
-- **Envoy admin interface (port 9901)**: Exposes operational endpoints. Accessible only within VPC via security groups.
+- **Envoy admin interface**: Loopback only. Port 9901 serves a read-only subset (readiness, stats, cluster membership) to the VPC, which still discloses the mesh's topology and task IPs to anything inside it.
 - **Control plane latency**: Endpoint updates propagate in a few seconds — an ECS task state change invokes the transformer, and sidecars pick up the new config on their next 5-second poll. Traffic may route to a terminating task during that window.
 
 ### Container Capability Risks

@@ -54,10 +54,10 @@ This document identifies trust boundaries, attack surfaces, threat scenarios, an
 | Component | Exposure | Ports |
 |-----------|----------|-------|
 | NLB | Internal (VPC only) | Per-service ports (e.g., 8080) |
-| Edge proxy Envoy | Via NLB only | 15000 (listener), 9901 (admin) |
-| Mesh service Envoy sidecars | VPC-internal | 15000, 9901 |
+| Edge proxy Envoy | Via NLB only | 15000 (listener), 9901 (read-only admin view) |
+| Mesh service Envoy sidecars | VPC-internal | 15000, 9901 (read-only admin view) |
 | App containers | VPC-internal | App port (e.g., 8080) |
-| Envoy admin interface | VPC-internal | 9901 |
+| Envoy admin interface | Loopback only | 127.0.0.1:9902 |
 | S3 xDS bucket | AWS API (IAM-gated) | HTTPS |
 | Lambda function | EventBridge-triggered | N/A |
 | AWS Cloud Map | AWS API (IAM-gated) | HTTPS |
@@ -121,16 +121,16 @@ This document identifies trust boundaries, attack surfaces, threat scenarios, an
 
 ### T5: Envoy admin interface exploitation
 
-**Threat:** Attacker with VPC access hits Envoy admin on port 9901 to dump configs, modify log levels, or trigger config drain.
+**Threat:** Attacker with VPC access uses Envoy's admin interface to dump configs, modify log levels, drain listeners, or stop Envoy.
 
-**Likelihood:** Low — requires VPC network access.
+**Likelihood:** Low — the admin interface listens on loopback only, so this requires code execution inside a task.
 
-**Impact:** Medium — information disclosure (service topology, endpoints), potential traffic disruption.
+**Impact:** Low from the VPC — the read-only view on port 9901 discloses service topology and task IPs; Medium from inside a task.
 
 **Mitigations:**
-- Admin port only accessible within VPC (security group restricted)
-- No internet-facing path to port 9901
-- Production: Disable admin interface or bind to localhost, use Envoy's admin access log filter
+- Admin interface bound to 127.0.0.1:9902
+- Port 9901 is a separate listener that passes only `GET /ready`, `/stats` and `/clusters` to it, and answers everything else with 403
+- 9901 is reachable only within the VPC (security group restricted), with no internet-facing path
 
 ### T6: SSRF against instance metadata
 

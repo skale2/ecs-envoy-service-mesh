@@ -9,7 +9,7 @@ A working demo of an Envoy-based service mesh on Amazon ECS (EC2 launch type). D
 - **Service API** — a REST endpoint (`POST /services/{name}`) that onboards new mesh services at runtime, no CDK required
 - **Load testing** — `POST /load/{target}` holds a fixed TPS against any service, using [Fortio](https://github.com/fortio/fortio)
 - **DynamoDB service registry** — one table both entrypoints write to and the control plane reads
-- **Three config files for the whole mesh** — the mesh is fully connected, so every proxy reads the same CDS/LDS/RDS
+- **Four config files for the whole mesh** — the mesh is fully connected, so every proxy reads the same CDS, EDS, LDS and RDS
 
 ## How It Works
 
@@ -33,6 +33,28 @@ Client calls predict.demo.mesh:8080
 ```
 
 Both paths use the same Envoy xDS configuration. The only difference is where the caller sits.
+
+### The control plane is four files
+
+There is no xDS server. A Lambda function (`xds-transformer/`) reads which services exist from the registry and where their tasks are from AWS Cloud Map, and writes four files to S3, the same four for every proxy in the mesh:
+
+| File | Holds |
+|---|---|
+| `cds.yaml` | a cluster per service, and a passthrough for traffic leaving the mesh |
+| `eds.yaml` | each service's tasks, grouped by zone |
+| `lds.yaml` | the listener on :15000 |
+| `rds.yaml` | a route per service, by Host header |
+
+Every proxy polls them every 5 seconds with conditional GETs (`envoy-sidecar/refresh.py`), so an unchanged file costs a 304, and moves a changed one into place, which is what Envoy watches for. Envoy reads a cluster's endpoints from a file of its own, so each proxy splits `eds.yaml` into `eds/<service>.yaml`, rewriting only the services whose tasks changed. A deploy or a scale-out therefore changes only endpoint files: Envoy updates the cluster's hosts in place and keeps its connections, instead of rebuilding the cluster.
+
+Two details make filesystem EDS reliable:
+
+- **Endpoints before clusters.** Envoy rejects a `cds.yaml` that names a cluster whose endpoints file doesn't exist yet, and doesn't look at it again until the next `cds.yaml`. So the transformer writes `eds.yaml` before `cds.yaml`, and each proxy reads them in the opposite order: having seen a cluster, it is sure to see that cluster's endpoints, and it writes them before moving `cds.yaml` into place.
+- **inotify instances.** Envoy watches each file with an inotify instance of its own, one per service. Linux allows 128 per user per host, and every sidecar on a host runs as the same user, so the hosts raise `fs.inotify.max_user_instances` at boot (`cdk/lib/mesh/mesh.ts`). Without it, Envoy aborts once a host's sidecars together watch more than 128 files.
+
+### Zone-aware routing
+
+A sidecar keeps each request in its own Availability Zone as far as the upstream's tasks there can take it, and spreads the rest, so a balanced service never pays for a cross-zone hop. Each sidecar learns its zone from the ECS task metadata, and its own service's spread across zones from the `local` cluster in its bootstrap, which reads the same endpoints file as the service's callers.
 
 ## Quick Start
 
@@ -61,13 +83,13 @@ TASK=$(aws ecs list-tasks --cluster $CLUSTER \
 aws ecs execute-command --cluster $CLUSTER --task $TASK \
   --container app --interactive --region us-west-2 \
   --command "curl -s http://features.demo.mesh:8080/health"
-# → {"service": "features", "status": "healthy"}
+# → {"service":"features","status":"healthy"}
 
 # Full round-trip: predict → sidecar → features → sidecar → predict
 aws ecs execute-command --cluster $CLUSTER --task $TASK \
   --container app --interactive --region us-west-2 \
   --command "curl -s http://features.demo.mesh:8080/call/predict"
-# → {"service": "features", "downstream_call": {"target": "predict", ...}}
+# → {"service":"features","called":"predict","response":{"service":"predict",...}}
 ```
 
 ### Option 2: From outside the mesh (edge proxy path)
@@ -98,37 +120,66 @@ curl http://features.demo.mesh:8080/call/predict
 ```bash
 source scripts/mesh.sh
 
-mesh create checkout               # the Python sample app; returns once it is routable
+mesh create checkout               # the sample app; returns once it is routable
 mesh exec checkout curl -s http://predict.demo.mesh:8080/call/features
+mesh scale checkout 20             # returns once all 20 tasks are running
 mesh list
 mesh delete checkout
 ```
 
-`mesh create <name> perf` runs a [Fortio](https://github.com/fortio/fortio) echo server instead, and `mesh create <name> <image-uri>` runs your own image. Run `mesh help` for the full list.
+`mesh create <name> <image-uri>` runs your own image instead of the sample app. Run `mesh help` for the full list.
+
+`mesh create <name> --nlb` builds the comparison case instead: the app alone, with no Envoy sidecar, behind an internal NLB of its own, and `<name>.demo.mesh` a CNAME to that NLB. Its own calls go out uninterrupted and through the next service's NLB, as they would without a mesh. Mesh callers, load generators included, still reach it by name: the control plane gives it an Envoy cluster that points at the NLB.
+
+A service can run up to 200 tasks (`mesh create --tasks N`, or `mesh scale` later). Every task is placed through the cluster's capacity provider, so when the tasks don't fit on the fleet — a t3.xlarge holds 3 awsvpc tasks, limited by its ENIs — ECS managed scaling adds instances, up to 200 of them, and drains them again once they are empty. Scaling one service from 40 to 130 tasks grew the fleet from 50 to 63 instances, and had every task running 3 minutes later.
 
 ## Load Testing
 
-A load test is a Fortio load generator running as a mesh service, `<target>-load`, with its own Envoy sidecar, so its requests take the same path real traffic does. It holds the requested TPS until it is deleted, and reports achieved TPS, latency percentiles and errors every 30 seconds.
+A load test is a mesh service, `<target>-load`, made of [Fortio](https://github.com/fortio/fortio) load generators with their own Envoy sidecars, so their requests take the same path real traffic does. It holds the requested TPS until it is deleted, and reports achieved TPS, latency percentiles and errors every 30 seconds.
+
+A test runs on as many generator tasks as its TPS needs, up to 1,000,000 TPS on 200 tasks, and the API works out how many. A generator's own Envoy sidecar is what runs out first, so each task is given at most 4,000 TPS, less for large payloads (16 KB costs ~20%, 64 KB ~40%) and for slow targets (each task stays under 1,000 connections). Every task ends its windows on the same :00 and :30, and the API sums their histograms, so the percentiles reported are of every request in the test, not an average of each task's.
 
 ```bash
-mesh create perf1 perf
-mesh load create perf1 2000 --delay 50 --resp 1024    # 2000 TPS, 50 ms server time, 1 KB responses
-mesh load watch perf1
-mesh load delete perf1
+mesh create a && mesh create b && mesh create c
+mesh load create a 1000 --path /call/b/c --delay 50    # load -> a -> b -> c, 50 ms at c
+mesh load watch a
+mesh load delete a
 ```
 
-`--delay` and `--resp` set the server's latency and response size on every request, which only a `perf` target honours. `--req` sends a request body of that size, and `--path` loads a specific route, e.g. `mesh load create features 100 --path /call/predict` for a two-hop chain.
+The sample app forwards along any `/call/...` path: `a` receives `/call/b/c`, asks `b` for `/call/c`, and `b` asks `c` for `/`. `--delay` and `--resp` set the latency and response size of whichever service ends the path, so every hop before it adds only what forwarding costs. `--req` sends a request body of that size.
 
-Measured on t3.xlarge with 1 KB responses, one load generator against one Fortio task:
+Measured through the mesh on t3.xlarge, 2 tasks per service, with every hop going through its caller's Envoy sidecar (median of the 30-second windows):
 
-| Target TPS | p50, 0 ms delay | p99, 0 ms delay | p50, 50 ms delay | p99, 50 ms delay | Errors |
+| Path | TPS held | p50 | p99 | Errors |
+|---|---|---|---|---|
+| One service | 6,000 | 1.3 ms | 5.4 ms | 0 |
+| Three hops | 3,000 | 5.3 ms | 29.7 ms | 0 |
+| Three hops | 6,000 | 4.2 ms | 19.5 ms | 0 |
+
+The sample app is one Go file using only the standard library. On a single core it answers about 33,000 requests a second, or forwards about 8,000. A forwarding hop's limit is usually its Envoy sidecar instead, at around 4,000 TPS per task, so size each service in a chain at one task per few thousand TPS.
+
+At scale, against one 40-task service:
+
+| Test | Load tasks | Achieved | p50 | p99 | Errors |
 |---|---|---|---|---|---|
-| 1,000 | 1.4 ms | 4.6 ms | 55.5 ms | 59.9 ms | 0 |
-| 2,000 | 1.5 ms | 7.6 ms | 55.6 ms | 68.3 ms | 0 |
-| 4,000 | 1.7 ms | 13.7 ms | 56.5 ms | 87.9 ms | 0 |
-| 8,000 | 4.6 ms | 71.6 ms | — | — | 0 |
+| 100,000 TPS | 25 | 99,850 | 1.4 ms | 22 ms | 0 |
+| 100,000 TPS, split finer | 40 | 99,850 | 1.4 ms | 21 ms | 0 |
 
-The limit is the load generator's own Envoy sidecar (about 2 cores at 4,000 TPS); the Fortio server uses about half a core at that rate.
+Splitting the same load across more generators doesn't change the tail, so the generators aren't what sets it. The busy fleet does: during these tests the median t3 instance peaked at 57% CPU, with up to 26% lost to hypervisor steal. Compute-optimized instances are the lever for a lower p99 at this scale.
+
+## Live Dashboard
+
+`dashboard/` draws the mesh as a live graph: one node per service, load generators and the edge proxy included, and an edge for every pair of services exchanging traffic. Particles flow along each edge at a rate that follows its TPS, and edges turn red when more than 1% of requests fail.
+
+Hovering an edge splits its latency into the part the hop itself added and the part the service it called spent answering: its own outbound call, or the delay a load test asked it for. The hop's share is the network plus the proxy in between, Envoy or an NLB. A load generator shows what it was asked to send, and hovering it lists every hop of its path that way.
+
+```bash
+python3 dashboard/serve.py      # then open http://127.0.0.1:8000
+```
+
+It needs only `python3` and `botocore` (installed with `awscurl`). The page polls `GET /graph` every 3 seconds through `serve.py`, which signs each request with your AWS credentials and listens on loopback only.
+
+`GET /graph` reads each task's Envoy stats, from the read-only view of its admin interface on port 9901 (the admin interface itself listens on loopback only), where every sidecar keeps a running count of the requests it has sent to each upstream, and returns those counts per task. The page turns two successive polls into rates. Counts are diffed per task rather than per service, since a counter restarts from zero when its task is replaced. A service behind an NLB has no Envoy to read, so its app keeps the same counts itself and serves them at `/stats`: the instrumentation every service would need if the mesh weren't counting for it.
 
 ## Architecture
 
@@ -142,8 +193,8 @@ The limit is the load generator's own Envoy sidecar (about 2 cores at 4,000 TPS)
                                 │
                                 ▼
                          ┌──────────────┐
-                         │ Amazon S3    │  CDS, EDS, LDS, RDS
-                         │  (xDS YAML)  │  per service + edge proxy
+                         │ Amazon S3    │  cds.yaml, eds.yaml, lds.yaml, rds.yaml
+                         │  (xDS YAML)  │  one set for the whole mesh
                          └──────┬───────┘
                                 │ Envoy polls Amazon S3 every 5s
                ┌────────────────┼────────────────┐
@@ -167,30 +218,37 @@ The limit is the load generator's own Envoy sidecar (about 2 cores at 4,000 TPS)
 ## Project Structure
 
 ```
-├── cdk/                          CDK infrastructure (TypeScript)
-│   ├── bin/app.ts               Stack entry point
+├── cdk/                              CDK infrastructure (TypeScript)
+│   ├── bin/app.ts                    the demo app
+│   ├── bin/templates.ts              synthesizes the templates behind the service API
 │   └── lib/
-│       ├── mesh-stack.ts        Demo stack: VPC + Mesh + services
-│       └── constructs/
-│           ├── mesh.ts          Mesh construct (cluster, control plane, edge proxy)
-│           ├── mesh-service.ts  Per-service construct (app + sidecar + DNS)
-│           ├── mesh-config.ts   Shared config interface
-│           ├── mesh-control-plane.ts   AWS Cloud Map, Amazon Route 53, Amazon S3, DynamoDB, AWS Lambda
-│           ├── mesh-service-api.ts     API Gateway + AWS Lambda (REST entrypoint)
-│           └── mesh-edge-proxy.ts      NLB + standalone Envoy
-├── service-api/                 REST entrypoint (Python AWS Lambda)
-│   ├── handler.py               Registry writes + CloudFormation CreateStack per service
-│   ├── service-template.json    Pre-synthesized template behind POST /services/{name}
-│   └── load-template.json       Pre-synthesized template behind POST /load/{target}
-├── xds-transformer/             xDS config generator (Python AWS Lambda)
-│   ├── transformer.py           Reads the registry + AWS Cloud Map, writes CDS/LDS/RDS to Amazon S3
-│   └── envoy_config.py          Envoy v3 API config builders
-├── envoy-sidecar/               Single Docker image for sidecar + edge proxy
-│   ├── entrypoint.sh            iptables setup, Amazon S3 fetch, bootstrap, Envoy launch
+│       ├── mesh-stack.ts             demo stack: VPC, mesh, two services, the API, a bastion
+│       ├── service-stack.ts          per-service template (POST /services)
+│       ├── load-stack.ts             per-load-test template (POST /load)
+│       ├── service-api/api.ts        API Gateway + the service API's Lambda functions
+│       └── mesh/
+│           ├── mesh.ts               the mesh: ECS cluster and hosts, control plane, edge proxy
+│           ├── service.ts            MeshService: a service's app, sidecar, and registry row
+│           ├── control-plane.ts      Cloud Map, Route 53, the xDS bucket, the registry, the transformer
+│           ├── edge-proxy.ts         the edge NLB and its standalone Envoy
+│           ├── registry-entry.ts     a registry row as a CloudFormation resource
+│           └── ref.ts                what a service needs from the mesh, shared through SSM
+├── xds-transformer/                  the control plane (Python Lambda)
+│   ├── transformer.py                reads the registry and Cloud Map, writes the four files to S3
+│   └── envoy_config.py               the files' content, as Envoy v3 API dicts
+├── envoy-sidecar/                    one image for the sidecar and the edge proxy
+│   ├── entrypoint.sh                 iptables, first fetch, bootstrap, Envoy
+│   ├── refresh.py                    keeps the files in step with S3
 │   └── Dockerfile
+├── service-api/                      REST entrypoint (Python Lambda)
+│   ├── handler.py                    services and load tests, a CloudFormation stack each
+│   ├── graph.py                      GET /graph: per-task request counters
+│   └── *-template.json               templates synthesized by bin/templates.ts
+├── dashboard/                        live mesh graph: index.html and a loopback signing proxy
+├── scripts/mesh.sh                   the `mesh` command
 └── sample-services/
-    ├── demo/                    Python sample app (identity via env vars)
-    └── perf/                    Fortio: perf target and load generator
+    ├── demo/                         Go sample app
+    └── load/                         Fortio load generator
 ```
 
 ## Cleanup
