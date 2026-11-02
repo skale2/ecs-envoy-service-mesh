@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Service mesh · live</title>
+  <style>
+    :root {
+      --bg: #141414; --panel: rgba(29, 29, 29, 0.88); --line: #2c2c2c;
+      --text: #ECEAE6; --muted: #A6A29A;
+      --service: #4D9FFF; --nlb: #B052FF; --load: #FF6200; --edge: #8F8B86;
+      --fast: #6EE750; --slow: #F3C300; --slower: #FF4D8B;
+    }
+    body {
+      margin: 0; overflow: hidden; color: var(--text);
+      background: radial-gradient(circle at 50% 45%, #1c1c1c, #0e0e0e 70%);
+      font: 14px "Amazon Ember", "Ember Modern Text", system-ui, sans-serif;
+    }
+    .panel {
+      position: fixed; z-index: 1; padding: 14px 18px; border-radius: 10px;
+      background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(6px);
+    }
+    #hud { top: 16px; left: 16px; pointer-events: none; }
+    h1 { margin: 0 0 10px; font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+    .stats { display: flex; gap: 30px; }
+    .stat b { display: block; font-size: 30px; font-weight: 600; line-height: 1.15; font-variant-numeric: tabular-nums; }
+    .stat span, .legend, th, .sub { color: var(--muted); font-size: 12px; }
+    #spark { display: block; margin-top: 12px; }
+    .legend { margin-top: 8px; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 5px 0 12px; vertical-align: -1px; }
+    .dot:first-child { margin-left: 0; }
+    #error { color: var(--slower); margin-top: 6px; }
+    #feed { bottom: 16px; left: 16px; width: 330px; font-size: 13px; pointer-events: none; }
+    #feed div { color: var(--muted); padding: 2px 0; }
+    #feed time { color: var(--edge); margin-right: 10px; font-variant-numeric: tabular-nums; }
+    #detail { top: 16px; right: 16px; width: 360px; display: none; }
+    #detail h2 { margin: 0; font-size: 20px; }
+    #detail h3 { margin: 16px 0 6px; font-size: 12px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { padding: 3px 0 3px 10px; text-align: right; font-weight: 400; }
+    th:first-child, td:first-child { padding-left: 0; text-align: left; }
+    .float-tooltip-kap {
+      background: var(--panel) !important; border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 12px !important; color: var(--text) !important; font: 13px/1.5 "Amazon Ember", system-ui, sans-serif;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/force-graph@1.52.0/dist/force-graph.min.js"
+          integrity="sha384-isW4dF8tfo3t+I2iiIdnz1MFV+hW1Vn3YyY2PmAgPbRQaW7Biahepz8fTRR+nLxm"
+          crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="hud" class="panel">
+    <h1>Service mesh · live</h1>
+    <div class="stats">
+      <div class="stat"><b id="tps">–</b><span>requests/s, all hops</span></div>
+      <div class="stat"><b id="services">–</b><span>services</span></div>
+      <div class="stat"><b id="errors">–</b><span>errors</span></div>
+      <div class="stat"><b id="p99">–</b><span>p99, slowest hop</span></div>
+    </div>
+    <svg id="spark" width="460" height="40"></svg>
+    <div class="legend">
+      <span class="dot" style="background:var(--service)"></span>mesh service
+      <span class="dot" style="background:var(--nlb)"></span>NLB service
+      <span class="dot" style="background:var(--load)"></span>load generator
+      <span class="dot" style="background:var(--edge)"></span>edge proxy
+      &nbsp;·&nbsp; edge p99:
+      <span class="dot" style="background:var(--fast)"></span>&lt;25 ms
+      <span class="dot" style="background:var(--slow)"></span>&lt;100 ms
+      <span class="dot" style="background:var(--slower)"></span>slower
+    </div>
+    <div id="error"></div>
+  </div>
+  <div id="feed" class="panel"></div>
+  <div id="detail" class="panel"></div>
+  <div id="graph"></div>
+
+  <script>
+    const POLL_MS = 3000;
+    const HISTORY = 100;          // sparkline samples: about five minutes
+    const PULSE_MS = 1600;        // how long a new service's ring takes to expand
+    const FADE_MS = 1500;         // how long a departing service takes to fade
+
+    const css = name => getComputedStyle(document.documentElement).getPropertyValue(`--${name}`).trim();
+    const C = Object.fromEntries(['text', 'muted', 'service', 'nlb', 'load', 'edge', 'fast', 'slow', 'slower'].map(k => [k, css(k)]));
+    const KIND_COLOR = { service: C.service, nlb: C.nlb, load: C.load, edge: C.edge };
+    const $ = id => document.getElementById(id);
+
+    const latencyColor = ms => ms == null ? C.muted : ms < 25 ? C.fast : ms < 100 ? C.slow : C.slower;
+    const fmtMs = ms => ms == null ? '–' : ms < 1 ? '<1 ms' : `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
+    const fmtTps = tps => tps >= 1000 ? `${(tps / 1000).toFixed(1)}k` : tps >= 10 ? `${Math.round(tps)}` : tps.toFixed(1);
+    const fmtPct = rate => `${(100 * rate).toFixed(rate < 0.1 ? 1 : 0)}%`;
+    const fmtStep = ms => ms < 1 ? `${ms.toFixed(1)} ms` : fmtMs(ms);
+    const esc = s => String(s).replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
+    const end = x => x.id ?? x;   // the graph library swaps a link's ids for node objects
+
+    // ---------------------------------------------------------------------
+    // Turning two polls into traffic
+    // ---------------------------------------------------------------------
+
+    // Request-weighted mean of a latency field, or null if nothing reported it.
+    function weighted(parts, field) {
+      const known = parts.filter(p => p[field] != null && p.requests > 0);
+      const weight = known.reduce((sum, p) => sum + p.requests, 0);
+      return weight ? known.reduce((sum, p) => sum + p[field] * p.requests, 0) / weight : null;
+    }
+
+    // Traffic along each edge between two polls.
+    //
+    // Counters are running totals, diffed per task and then summed per
+    // service: a counter lives in one Envoy process, so it restarts from zero
+    // when its task does, and a task with no earlier sample is skipped until
+    // it has one. Latency is each task's own recent p50/p99, weighted by how
+    // many requests that task sent.
+    function edgeRates(before, now) {
+      const seconds = (now.at - before.at) / 1000;
+      const earlier = new Map(before.counters.map(c => [`${c.task} ${c.target}`, c]));
+      const edges = new Map();
+      for (const c of now.counters) {
+        const prev = earlier.get(`${c.task} ${c.target}`);
+        if (!prev) continue;
+        const restarted = c.requests < prev.requests;
+        const requests = restarted ? c.requests : c.requests - prev.requests;
+        if (requests <= 0) continue;
+        const key = `${c.source} ${c.target}`;
+        const edge = edges.get(key) ?? { source: c.source, target: c.target, parts: [] };
+        edge.parts.push({ requests, errors: restarted ? c.errors : c.errors - prev.errors, p50Ms: c.p50Ms, p99Ms: c.p99Ms });
+        edges.set(key, edge);
+      }
+      return [...edges.values()].map(({ source, target, parts }) => {
+        const requests = parts.reduce((sum, p) => sum + p.requests, 0);
+        const errors = parts.reduce((sum, p) => sum + p.errors, 0);
+        return { source, target, requests, tps: requests / seconds, errorRate: errors / requests,
+                 p50Ms: weighted(parts, 'p50Ms'), p99Ms: weighted(parts, 'p99Ms') };
+      });
+    }
+
+    // Totals over a set of edges: everything arriving at a service, say.
+    function traffic(edges) {
+      const requests = edges.reduce((sum, e) => sum + e.requests, 0);
+      return {
+        tps: edges.reduce((sum, e) => sum + e.tps, 0),
+        errorRate: requests ? edges.reduce((sum, e) => sum + e.errorRate * e.requests, 0) / requests : 0,
+        p50Ms: weighted(edges, 'p50Ms'),
+        p99Ms: weighted(edges, 'p99Ms'),
+      };
+    }
+
+    // ---------------------------------------------------------------------
+    // State. Nodes and links are kept across polls, so the layout holds
+    // still and rates can ease from one value to the next.
+    // ---------------------------------------------------------------------
+
+    const nodes = new Map();      // id -> node
+    const links = new Map();      // "source target" -> link
+    const loads = new Map();      // "<target>-load" -> that load test's settings
+    let loadsAt = 0;
+    const history = [];
+    const feed = [];
+    let previous = null;
+    let shape = '';               // which services exist and which edges carry traffic
+    let refit = false;            // fit once the first layout has come to rest
+    let fitted = false;           // after that, the view is the user's
+    let loose = null;             // the group being dragged, free until it settles
+    let selected = null;
+
+    const radius = n => 4 + 3 * Math.log10(1 + (n.shownTraffic ?? 0));
+    const loadTarget = id => id.slice(0, -'-load'.length);
+    // Where new services go, worked out whenever the graph's shape changes.
+    // Services that call each other form a group; each group gets its own
+    // patch of the canvas, on a sunflower spiral out from the middle, so one
+    // group's edges don't run across another's. Groups that are already on
+    // screen keep their place: only new nodes are placed, next to a service
+    // they talk to if there is one, or at the next spot on the spiral.
+    const spiral = { k: 0, area: 0 };
+    function arrange() {
+      const live = [...nodes.values()].filter(n => !n.leftAt);
+      const ids = new Set(live.map(n => n.id));
+      const group = new Map(live.map(n => [n.id, n.id]));
+      const root = id => group.get(id) === id ? id : root(group.get(id));
+      const neighbours = new Map(live.map(n => [n.id, []]));
+      for (const l of links.values()) {
+        const a = end(l.source), b = end(l.target);
+        if (!ids.has(a) || !ids.has(b)) continue;
+        neighbours.get(a).push(b); neighbours.get(b).push(a);
+        if (root(a) !== root(b)) group.set(root(a), root(b));
+      }
+      const groups = new Map();
+      for (const n of live) (groups.get(root(n.id)) ?? groups.set(root(n.id), []).get(root(n.id))).push(n);
+
+      const GOLDEN = Math.PI * (3 - Math.sqrt(5));
+      const jitter = () => (Math.random() - 0.5) * 60;
+      // Bigger groups first, so they take the middle of the spiral and idle
+      // services end up on its outer turns rather than between groups.
+      const bySize = [...groups].sort(([, a], [, b]) => b.length - a.length || a[0].id.localeCompare(b[0].id));
+      for (const [id, members] of bySize) {
+        // A new edge can join two groups that are already on screen, each in
+        // its own patch. The biggest stays put and the others are freed to
+        // join it, so the edge between them doesn't stretch across the canvas.
+        const before = new Map();
+        for (const n of members) if (n.x != null) (before.get(n.group) ?? before.set(n.group, []).get(n.group)).push(n);
+        const hasService = part => part.some(n => n.kind !== 'load');
+        const [anchor, ...joining] = [...before.values()].sort((a, b) =>
+          b.length - a.length || hasService(b) - hasService(a) || a[0].id.localeCompare(b[0].id));
+        for (const n of joining.flat()) n.fx = n.fy = undefined;
+        for (const n of members) n.group = id;
+        const placed = anchor ?? [];
+        let home;
+        if (placed.length) {
+          home = { x: placed.reduce((a, n) => a + n.x, 0) / placed.length, y: placed.reduce((a, n) => a + n.y, 0) / placed.length };
+        } else {
+          // The spiral's radius grows with the room the groups placed so far
+          // take up, so a big group isn't crowded by its neighbours. It is
+          // wider than tall, like the screen it is fitted to.
+          const r = Math.sqrt(spiral.area / Math.PI) * 1.25, k = spiral.k++;
+          home = { x: 1.5 * r * Math.cos(k * GOLDEN), y: 0.85 * r * Math.sin(k * GOLDEN) };
+          spiral.area += Math.PI * (members.length > 1 ? 100 * Math.sqrt(members.length) : 45) ** 2;
+        }
+        for (const n of members) {
+          n.homeX = home.x; n.homeY = home.y;
+          if (n.x != null) continue;
+          const friend = neighbours.get(n.id).map(i => nodes.get(i)).find(m => m.x != null);
+          n.x = (friend ?? home).x + jitter(); n.y = (friend ?? home).y + jitter();
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Where the time goes
+    // ---------------------------------------------------------------------
+
+    // The services a load test's requests pass through, in order: the
+    // generator, its target, then each hop of a /call/... path.
+    function chainOf(test) {
+      const hops = test.path.startsWith('/call/') ? test.path.slice('/call/'.length).split('/').filter(Boolean) : [];
+      return [`${test.target}-load`, test.target, ...hops];
+    }
+
+    // How long a service took to answer, as far as the graph can tell: the
+    // p50 of its one outbound call, or, where a load test's path ends, the
+    // delay it was told to add. Null if it calls several services, or if
+    // nothing says what it does.
+    function downstreamMs(id) {
+      const out = [...links.values()].filter(l => end(l.source) === id);
+      if (out.length === 1) return out[0].p50Ms == null ? null : { ms: out[0].p50Ms, via: `${id} → ${end(out[0].target)}` };
+      if (out.length > 1) return null;
+      const delays = new Set([...loads.values()].filter(t => chainOf(t).at(-1) === id).map(t => t.delayMs));
+      return delays.size === 1 ? { ms: [...delays][0], via: `${id}'s configured delay` } : null;
+    }
+
+    // What one hop added: its p50 less the time the service it called spent
+    // answering. That leaves the network, both Envoy hops and the callee's own
+    // forwarding work. A difference of medians, so read it as an estimate.
+    function stepMs(l) {
+      const down = downstreamMs(end(l.target));
+      return down && l.p50Ms != null ? { ms: Math.max(0, l.p50Ms - down.ms), down } : null;
+    }
+
+    // A load test's path, one row per hop.
+    function stepsTable(test) {
+      const chain = chainOf(test);
+      const rows = chain.slice(1).map((to, i) => {
+        const l = links.get(`${chain[i]} ${to}`), step = l && stepMs(l);
+        return `<tr><td>${esc(chain[i])} → ${esc(to)}</td><td>${fmtMs(l?.p50Ms)}</td><td>${step ? fmtStep(step.ms) : '–'}</td></tr>`;
+      });
+      rows.push(`<tr><td>${esc(chain.at(-1))} answers</td><td></td><td>${test.delayMs} ms delay</td></tr>`);
+      return `<table><tr><th>step</th><th>p50</th><th>this hop</th></tr>${rows.join('')}</table>`;
+    }
+
+    async function refreshLoads() {
+      loadsAt = Date.now();
+      try {
+        const res = await fetch('/api/load');
+        if (!res.ok) return;
+        loads.clear();
+        for (const test of (await res.json()).loads) loads.set(`${test.target}-load`, test);
+      } catch { /* keep the last settings until the next try */ }
+    }
+
+    function log(text) {
+      feed.unshift({ at: new Date(), text });
+      feed.length = Math.min(feed.length, 8);
+    }
+
+    // ---------------------------------------------------------------------
+    // Drawing
+    // ---------------------------------------------------------------------
+
+    function drawNode(n, ctx, scale) {
+      const now = performance.now();
+      const r = radius(n);
+      const color = KIND_COLOR[n.kind];
+      const alpha = n.leftAt ? Math.max(0, 1 - (now - n.leftAt) / FADE_MS) : 1;
+
+      const age = now - n.joinedAt;
+      if (age < PULSE_MS) {
+        const p = age / PULSE_MS;
+        ctx.globalAlpha = alpha * (1 - p);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2 / scale;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 28 * p, 0, 2 * Math.PI); ctx.stroke();
+      }
+
+      ctx.globalAlpha = alpha;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 2 * Math.PI); ctx.fill();
+      ctx.shadowBlur = 0;
+
+      if (n.id === selected) {
+        ctx.strokeStyle = C.text;
+        ctx.lineWidth = 1.5 / scale;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 4 / scale, 0, 2 * Math.PI); ctx.stroke();
+      }
+
+      ctx.font = `${12 / scale}px "Amazon Ember", system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = C.text;
+      ctx.fillText(n.id, n.x, n.y + r + 4 / scale);
+      const test = n.kind === 'load' && loads.get(n.id);
+      if (test) {
+        ctx.font = `${10 / scale}px "Amazon Ember", system-ui, sans-serif`;
+        ctx.fillStyle = C.load;
+        ctx.fillText(`${fmtTps(test.tps)} TPS · ${test.delayMs} ms`, n.x, n.y + r + 19 / scale);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    const muted = text => `<span style="color:${C.muted}">${text}</span>`;
+
+    function nodeTooltip(n) {
+      const test = n.kind === 'load' && loads.get(n.id);
+      if (test) return `
+        <b>${esc(n.id)}</b> · ${n.tasks} task${n.tasks === 1 ? '' : 's'}<br>
+        asked for ${fmtTps(test.tps)} TPS · ${test.delayMs} ms delay · ${esc(test.path)}<br>
+        sending ${fmtTps(n.outbound.tps)} TPS · ${fmtPct(n.outbound.errorRate)} errors
+        ${stepsTable(test)}`;
+      return `
+        <b>${esc(n.id)}</b> · ${n.tasks} task${n.tasks === 1 ? '' : 's'}<br>
+        in: ${fmtTps(n.inbound.tps)} TPS · ${fmtPct(n.inbound.errorRate)} errors ·
+            p50 ${fmtMs(n.inbound.p50Ms)} · p99 ${fmtMs(n.inbound.p99Ms)}<br>
+        out: ${fmtTps(n.outbound.tps)} TPS`;
+    }
+
+    function linkTooltip(l) {
+      const step = stepMs(l);
+      return `
+        <b>${esc(end(l.source))} → ${esc(end(l.target))}</b><br>
+        ${fmtTps(l.tps)} TPS · ${fmtPct(l.errorRate)} errors<br>
+        p50 ${fmtMs(l.p50Ms)} · p99 ${fmtMs(l.p99Ms)}` + (step ? `<br>
+        ${muted(`of the p50, ${esc(step.down.via)}: ${fmtMs(step.down.ms)}`)}<br>
+        <b>this hop: ~${fmtStep(step.ms)}</b> ${muted(nodes.get(end(l.target))?.kind === 'nlb' ? 'network + NLB' : 'network + Envoy')}` : '');
+    }
+
+    const graph = ForceGraph()($('graph'))
+      .backgroundColor('rgba(0, 0, 0, 0)')
+      .autoPauseRedraw(false)                       // keep pulses, fades and easing animating
+      .nodeCanvasObject(drawNode)
+      .nodePointerAreaPaint((n, color, ctx) => {
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(n.x, n.y, radius(n) + 3, 0, 2 * Math.PI); ctx.fill();
+      })
+      .nodeLabel(nodeTooltip)
+      .onNodeClick(n => { selected = n.id; renderDetail(); })
+      .onBackgroundClick(() => { selected = null; renderDetail(); })
+      .linkCurvature(0.18)                          // A→B and B→A arc to opposite sides
+      .linkColor(l => `${latencyColor(l.p99Ms)}99`)
+      .linkWidth(l => 1 + 2 * Math.log10(1 + l.shownTps))
+      .linkLabel(linkTooltip)
+      // Particle count, size and speed all grow with TPS; red means errors.
+      .linkDirectionalParticles(l => Math.min(10, Math.ceil(Math.log2(1 + l.tps))))
+      .linkDirectionalParticleWidth(l => 2.5 + Math.log10(1 + l.shownTps) / 2)
+      .linkDirectionalParticleSpeed(l => Math.min(0.025, 0.004 + l.shownTps / 80_000))
+      .linkDirectionalParticleColor(l => l.errorRate > 0.01 ? C.slower : C.text)
+      .onRenderFramePre(() => {
+        // Ease toward each poll's numbers instead of jumping to them.
+        for (const l of links.values()) l.shownTps += (l.tps - l.shownTps) * 0.06;
+        for (const n of nodes.values()) {
+          const target = n.leftAt ? 0 : n.inbound.tps + n.outbound.tps;
+          n.shownTraffic += (target - n.shownTraffic) * 0.06;
+        }
+      })
+      .cooldownTicks(60)
+      // Dragging a node frees the rest of its group, so its neighbours trail
+      // behind on their links, nearest first, and can be reshaped by dragging
+      // them in turn; other groups stay pinned. The dragged node stays where
+      // it is dropped. The layout is at rest when a drag begins, and the
+      // library only eases it toward a low heat, so freeing the group also
+      // reheats it: its links pull from the first moment instead of letting
+      // the dragged node run ahead of them.
+      .onNodeDrag(dragged => {
+        if (loose !== dragged.group) {
+          if (loose != null) pinGroup(loose);
+          loose = dragged.group;
+          for (const n of nodes.values()) if (n !== dragged && n.group === loose) n.fx = n.fy = undefined;
+          graph.d3ReheatSimulation();
+        }
+        graph.cooldownTicks(120);
+      })
+      // On release the group gets a fresh, full-strength settle, so links
+      // pulled long by a fast drag relax back to their length before the
+      // group is pinned again.
+      .onNodeDragEnd(() => { graph.cooldownTicks(200); graph.d3ReheatSimulation(); })
+      // Once the layout has come to rest, every node is pinned where it is:
+      // the graph then stays still as traffic changes, and only nodes that
+      // appear later are laid out.
+      .onEngineStop(() => {
+        if (loose != null) pinGroup(loose);
+        loose = null;
+        for (const n of nodes.values()) { n.fx = n.x; n.fy = n.y; }
+        if (refit) { refit = false; graph.zoomToFit(600, 220); }
+      })
+      .maxZoom(3);
+
+    // More room than the library's defaults, so labels clear the edges and
+    // the particles have distance to travel; the repulsion is capped so
+    // services with no traffic stay near the rest instead of drifting away.
+    graph.d3Force('charge').strength(-250).distanceMax(300);
+    graph.d3Force('link').distance(140);
+    // No centering force. It holds the mean of every node at the origin, and
+    // with every other group pinned, the whole correction for a drag lands
+    // on the few free nodes of the dragged group, pulling them back against
+    // the drag and stretching its links. The home force below keeps the
+    // groups in their places instead.
+    graph.d3Force('center', null);
+
+    // Pins a group where it is and makes that its home, so a group that was
+    // dragged stays where it was taken.
+    function pinGroup(group) {
+      const members = [...nodes.values()].filter(n => n.group === group);
+      if (!members.length) return;
+      const x = members.reduce((a, n) => a + n.x, 0) / members.length;
+      const y = members.reduce((a, n) => a + n.y, 0) / members.length;
+      for (const n of members) { n.fx = n.x; n.fy = n.y; n.homeX = x; n.homeY = y; }
+    }
+
+    // Moves each group, as a whole, toward its home from arrange(): every
+    // node in a group gets the same nudge, from the group's centre, so the
+    // groups keep their own patches (and stop drifting apart) while the
+    // shape inside a group is left to the other forces.
+    function toHome(strength) {
+      let all = [];
+      const force = alpha => {
+        const centres = new Map();
+        for (const n of all) {
+          if (n.homeX == null || n.group === loose) continue;   // a dragged group goes where it's taken
+          const c = centres.get(n.group) ?? centres.set(n.group, { x: 0, y: 0, n: 0 }).get(n.group);
+          c.x += n.x; c.y += n.y; c.n++;
+        }
+        for (const n of all) {
+          const c = centres.get(n.group);
+          if (!c) continue;
+          n.vx += (n.homeX - c.x / c.n) * strength * alpha;
+          n.vy += (n.homeY - c.y / c.n) * strength * alpha;
+        }
+      };
+      force.initialize = ns => { all = ns; };
+      return force;
+    }
+    graph.d3Force('home', toHome(0.3));
+    addEventListener('resize', () => graph.width(innerWidth).height(innerHeight));
+
+    // ---------------------------------------------------------------------
+    // Panels
+    // ---------------------------------------------------------------------
+
+    function renderHud(edges) {
+      const total = traffic(edges);
+      const worst = Math.max(...edges.map(e => e.p99Ms ?? 0));
+      history.push(total.tps);
+      if (history.length > HISTORY) history.shift();
+
+      $('tps').textContent = fmtTps(total.tps);
+      $('services').textContent = [...nodes.values()].filter(n => ['service', 'nlb'].includes(n.kind) && !n.leftAt).length;
+      $('errors').textContent = fmtPct(total.errorRate);
+      $('errors').style.color = total.errorRate > 0.01 ? C.slower : '';
+      $('p99').textContent = edges.length ? fmtMs(worst) : '–';
+      $('p99').style.color = edges.length ? latencyColor(worst) : '';
+
+      // Newest sample at the right edge, scaled to the largest one shown.
+      const w = 460, h = 40, max = Math.max(1, ...history), step = w / (HISTORY - 1);
+      const points = history.map((v, i) => `${w - (history.length - 1 - i) * step},${h - 3 - (v / max) * (h - 6)}`);
+      $('spark').innerHTML = history.length < 2 ? '' :
+        `<polyline points="${points.join(' ')}" fill="none" stroke="${C.load}" stroke-width="2" stroke-linejoin="round"/>`;
+    }
+
+    function renderFeed() {
+      $('feed').innerHTML = feed.map(e =>
+        `<div><time>${e.at.toLocaleTimeString()}</time>${esc(e.text)}</div>`).join('');
+    }
+
+    async function renderDetail() {
+      const n = nodes.get(selected);
+      $('detail').style.display = n ? 'block' : 'none';
+      if (!n) return;
+
+      const row = (name, l) => `<tr><td>${esc(name)}</td><td>${fmtTps(l.tps)}</td><td>${fmtPct(l.errorRate)}</td>
+        <td>${fmtMs(l.p50Ms)}</td><td style="color:${latencyColor(l.p99Ms)}">${fmtMs(l.p99Ms)}</td></tr>`;
+      const table = rows => rows.length
+        ? `<table><tr><th></th><th>TPS</th><th>errors</th><th>p50</th><th>p99</th></tr>${rows.join('')}</table>`
+        : '<div class="sub">none</div>';
+      const byTps = (a, b) => b.tps - a.tps;
+      const inbound = [...links.values()].filter(l => end(l.target) === n.id).sort(byTps);
+      const outbound = [...links.values()].filter(l => end(l.source) === n.id).sort(byTps);
+
+      let html = `
+        <h2>${esc(n.id)}</h2>
+        <div class="sub">${{ load: 'load generator', edge: 'edge proxy', nlb: 'NLB service' }[n.kind] ?? 'mesh service'}
+          · ${n.tasks} task${n.tasks === 1 ? '' : 's'}</div>
+        <h3>Inbound</h3>${table([...(inbound.length ? [row('all callers', n.inbound)] : []),
+                                  ...inbound.map(l => row(end(l.source), l))])}
+        <h3>Outbound</h3>${table(outbound.map(l => row(end(l.target), l)))}`;
+
+      if (n.kind === 'load') {
+        try {
+          const test = await (await fetch(`/api/load/${loadTarget(n.id)}`)).json();
+          const windows = test.windows.slice(-5).reverse().map(w => `<tr><td>${w.at.slice(11, 19)}</td>
+            <td>${fmtTps(w.achievedTps)}</td><td>${w.errors}</td><td>${fmtMs(w.p50Ms)}</td>
+            <td style="color:${latencyColor(w.p99Ms)}">${fmtMs(w.p99Ms)}</td></tr>`);
+          html += `<h3>Load test</h3>
+            <div class="sub">${test.tps} TPS on ${test.tasks} task${test.tasks === 1 ? '' : 's'} · ${test.delayMs} ms server delay
+              · ${test.responseBytes} B responses · ${esc(test.path)} · ${test.status}</div>
+            <h3>Where the time goes</h3>${stepsTable(test)}
+            <table><tr><th>window</th><th>TPS</th><th>errors</th><th>p50</th><th>p99</th></tr>${windows.join('')}</table>`;
+        } catch {
+          html += '<h3>Load test</h3><div class="sub">results unavailable</div>';
+        }
+      }
+      if (selected === n.id) $('detail').innerHTML = html;
+    }
+
+    // ---------------------------------------------------------------------
+    // Polling
+    // ---------------------------------------------------------------------
+
+    async function poll() {
+      if (Date.now() - loadsAt > 15_000) refreshLoads();   // settings rarely change
+      let now;
+      try {
+        const res = await fetch('/api/graph');
+        if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+        now = await res.json();
+        $('error').textContent = '';
+      } catch (e) {
+        $('error').textContent = `poll failed: ${e.message}`;
+        return;
+      }
+      const t = performance.now();
+      const first = previous === null;
+      const label = n => n.kind === 'load' ? `load test on ${loadTarget(n.id)}` : n.id;
+
+      // New services pulse in; departed ones fade out, then are removed.
+      const ids = new Set(now.nodes.map(n => n.id));
+      for (const n of now.nodes) {
+        let node = nodes.get(n.id);
+        if (!node || node.leftAt) {
+          if (!first) log(`${label(n)} ${n.kind === 'load' ? 'started' : 'joined the mesh'}`);
+          node = node ?? { shownTraffic: 0 };
+          node.joinedAt = t;
+          delete node.leftAt;
+          nodes.set(n.id, node);
+        }
+        Object.assign(node, n);
+      }
+      for (const [id, node] of nodes) {
+        if (ids.has(id)) continue;
+        if (!node.leftAt) {
+          node.leftAt = t;
+          log(`${label(node)} ${node.kind === 'load' ? 'stopped' : 'left the mesh'}`);
+        } else if (t - node.leftAt > FADE_MS) {
+          nodes.delete(id);
+        }
+      }
+      const count = kind => now.nodes.filter(n => n.kind === kind).length;
+      if (first) log(`watching ${count('service')} services and ${count('load')} load tests`);
+
+      const edges = first ? [] : edgeRates(previous, now);
+      previous = now;
+      const live = new Set(edges.map(e => `${e.source} ${e.target}`));
+      for (const key of links.keys()) if (!live.has(key)) links.delete(key);
+      for (const { source, target, ...rates } of edges) {
+        const key = `${source} ${target}`;
+        links.set(key, Object.assign(links.get(key) ?? { source, target, shownTps: 0 }, rates));
+      }
+      for (const n of nodes.values()) {
+        n.inbound = traffic(edges.filter(e => e.target === n.id));
+        n.outbound = traffic(edges.filter(e => e.source === n.id));
+      }
+      // Edges take two polls to measure, and the layout groups services by
+      // their edges, so the first layout waits for the second poll.
+      if (first) { renderFeed(); return; }
+
+      // When the shape changes, lay it out fully before drawing and reframe
+      // it. When only the rates change, leave the layout and the view alone.
+      const newShape = JSON.stringify([[...nodes.keys()].sort(), [...links.keys()].sort()]);
+      const reshaped = newShape !== shape;
+      shape = newShape;
+      if (reshaped) arrange();
+      // New data restarts the layout at full energy, so a poll that only
+      // changes rates gets no ticks at all: otherwise every poll nudges the
+      // graph a little further apart. A group being dragged or still settling
+      // is left to finish instead: its nodes and links are the same objects,
+      // so their rates are already current, and the particles catch up on the
+      // next poll.
+      if (reshaped || loose == null) {
+        graph.warmupTicks(reshaped ? 150 : 0);
+        if (loose == null) graph.cooldownTicks(reshaped ? 60 : 0);
+        graph.graphData({ nodes: [...nodes.values()], links: [...links.values()] });
+      }
+      // Generous padding: the HUD covers the top-left corner.
+      if (reshaped && !fitted) { fitted = refit = true; setTimeout(() => graph.zoomToFit(600, 220), 50); }
+
+      if (!first) renderHud(edges);
+      renderFeed();
+      if (selected) renderDetail();
+    }
+
+    poll();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
